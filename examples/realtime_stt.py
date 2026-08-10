@@ -18,7 +18,8 @@ def create_stt() -> SarvamRealtimeSTTService:
             stream_type="fast",
             endpointing="vad",
             mode="transcribe",
-            return_timestamps=True,
+            encoding="linear16",
+            sample_rate=16000,
         ),
     )
 

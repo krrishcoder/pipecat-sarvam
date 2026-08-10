@@ -26,7 +26,6 @@ async def test_live_adapter_transcribes_hindi_wav() -> None:
 
     service = SarvamRealtimeSTTService(
         api_key=get_api_key(Path(".env")),
-        settings=SarvamRealtimeSTTService.Settings(return_timestamps=True),
         keepalive_timeout=None,
     )
     source = inspect_audio(audio_path, raw_sample_rate=16000)
@@ -65,6 +64,8 @@ async def test_live_adapter_transcribes_hindi_wav() -> None:
     service.push_frame = capture_frame  # type: ignore[method-assign]
     service.broadcast_frame = no_op  # type: ignore[method-assign]
     service.broadcast_interruption = no_op  # type: ignore[method-assign]
+    service.start_ttfb_metrics = no_op  # type: ignore[method-assign]
+    service.stop_ttfb_metrics = no_op  # type: ignore[method-assign]
     service.start_processing_metrics = no_op  # type: ignore[method-assign]
     service.stop_processing_metrics = no_op  # type: ignore[method-assign]
     service.emit_stt_usage_metrics = no_op  # type: ignore[method-assign]

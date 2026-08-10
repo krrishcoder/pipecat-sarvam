@@ -71,7 +71,7 @@ LanguageCode = Literal[
 StreamType = Literal["fast", "balanced", "simulated"]
 Endpointing = Literal["vad", "manual"]
 Mode = Literal["transcribe", "translate", "verbatim", "translit", "codemix"]
-Encoding = Literal["linear16", "linear32", "mulaw", "alaw"]
+Encoding = Literal["linear16"]
 
 SUPPORTED_LANGUAGE_CODES = {
     "auto",
@@ -102,15 +102,10 @@ SUPPORTED_LANGUAGE_CODES = {
 SUPPORTED_STREAM_TYPES = {"fast", "balanced", "simulated"}
 SUPPORTED_ENDPOINTING = {"vad", "manual"}
 SUPPORTED_MODES = {"transcribe", "translate", "verbatim", "translit", "codemix"}
-SUPPORTED_ENCODINGS = {"linear16", "linear32", "mulaw", "alaw"}
+SUPPORTED_ENCODINGS = {"linear16"}
 SUPPORTED_SAMPLE_RATES = {8000, 16000}
 
-_BYTES_PER_SAMPLE = {
-    "linear16": 2,
-    "linear32": 4,
-    "mulaw": 1,
-    "alaw": 1,
-}
+_BYTES_PER_SAMPLE = {"linear16": 2}
 _MAX_CHUNK_DURATION_SECONDS = {
     "fast": 0.5,
     "balanced": 1.0,
@@ -167,14 +162,8 @@ class SarvamRealtimeSTTSettings(STTSettings):
     stream_type: StreamType | str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     endpointing: Endpointing | str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     mode: Mode | str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    prompt: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    threshold: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    silence_duration_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    min_speech_duration_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     encoding: Encoding | str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     sample_rate: int | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    prefix_padding_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    return_timestamps: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class SarvamRealtimeSTTService(WebsocketSTTService):
@@ -223,14 +212,8 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             stream_type="fast",
             endpointing="vad",
             mode="transcribe",
-            prompt=None,
-            threshold=None,
-            silence_duration_ms=None,
-            min_speech_duration_ms=None,
             encoding="linear16",
             sample_rate=sample_rate,
-            prefix_padding_ms=None,
-            return_timestamps=False,
         )
 
         if settings is not None:
@@ -272,6 +255,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         self._session_ended = asyncio.Event()
         self._request_id: str | None = None
         self._session_end_data: dict[str, Any] | None = None
+        self._ttft_pending = False
 
     @staticmethod
     def _validate_settings(settings: Settings) -> None:
@@ -281,12 +265,8 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         stream_type = assert_given(settings.stream_type)
         endpointing = assert_given(settings.endpointing)
         mode = assert_given(settings.mode)
-        threshold = assert_given(settings.threshold)
-        silence_duration_ms = assert_given(settings.silence_duration_ms)
-        min_speech_duration_ms = assert_given(settings.min_speech_duration_ms)
         encoding = assert_given(settings.encoding)
         sample_rate = assert_given(settings.sample_rate)
-        prefix_padding_ms = assert_given(settings.prefix_padding_ms)
 
         if model != SARVAM_REALTIME_MODEL:
             raise ValueError(f"model must be {SARVAM_REALTIME_MODEL!r}")
@@ -299,17 +279,9 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         if mode not in SUPPORTED_MODES:
             raise ValueError(f"Unsupported mode: {mode!r}")
         if encoding not in SUPPORTED_ENCODINGS:
-            raise ValueError(f"Unsupported encoding: {encoding!r}")
+            raise ValueError("Only linear16 PCM input is supported initially")
         if sample_rate not in SUPPORTED_SAMPLE_RATES:
             raise ValueError("sample_rate must be 8000 or 16000")
-        if threshold is not None and not 0.0 <= threshold <= 1.0:
-            raise ValueError("threshold must be between 0.0 and 1.0")
-        if silence_duration_ms is not None and silence_duration_ms < 0:
-            raise ValueError("silence_duration_ms cannot be negative")
-        if min_speech_duration_ms is not None and min_speech_duration_ms < 0:
-            raise ValueError("min_speech_duration_ms cannot be negative")
-        if prefix_padding_ms is not None and prefix_padding_ms < 0:
-            raise ValueError("prefix_padding_ms cannot be negative")
 
     def can_generate_metrics(self) -> bool:
         """Return whether this service emits Pipecat metrics."""
@@ -352,9 +324,10 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         if self._settings.endpointing != "manual":
             return
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            await self.start_processing_metrics()
+            await self._begin_utterance_metrics()
             await self._send_json({"event": "speech_start"})
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._user_speaking = False
             await self._send_json({"event": "speech_end"})
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
@@ -414,16 +387,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             "endpointing": assert_given(settings.endpointing),
             "encoding": assert_given(settings.encoding),
             "sample_rate": assert_given(settings.sample_rate),
-            "return_timestamps": str(assert_given(settings.return_timestamps)).lower(),
         }
-        optional_params = {
-            "prompt": assert_given(settings.prompt),
-            "threshold": assert_given(settings.threshold),
-            "silence_duration_ms": assert_given(settings.silence_duration_ms),
-            "min_speech_duration_ms": assert_given(settings.min_speech_duration_ms),
-            "prefix_padding_ms": assert_given(settings.prefix_padding_ms),
-        }
-        params.update({key: value for key, value in optional_params.items() if value is not None})
         return f"{self._base_url}?{urlencode(params)}"
 
     async def _connect(self):
@@ -541,11 +505,12 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             self._session_ready.set()
             logger.info(f"{self} Sarvam session started request_id={self._request_id}")
         elif event == "vad.speech_start":
-            await self.start_processing_metrics()
+            await self._begin_utterance_metrics()
             await self.broadcast_frame(UserStartedSpeakingFrame)
             if self._should_interrupt:
                 await self.broadcast_interruption()
         elif event == "vad.speech_end":
+            self._user_speaking = False
             await self.broadcast_frame(UserStoppedSpeakingFrame)
         elif event == "transcript.partial":
             await self._handle_partial_transcript(message)
@@ -561,6 +526,31 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         elif event != "pong":
             logger.debug(f"{self} unhandled Sarvam event: {message}")
 
+    async def _begin_utterance_metrics(self):
+        """Start first-transcript and final-transcript latency measurements."""
+        await self._reset_stt_ttfb_state()
+        self._user_speaking = True
+        self._can_reconnect = False
+        self._ttft_pending = True
+        await self.start_ttfb_metrics()
+        await self.start_processing_metrics()
+
+    async def _mark_first_transcript_received(self):
+        """Report latency to the first non-empty interim or final transcript."""
+        if not self._ttft_pending:
+            return
+        self._ttft_pending = False
+        await self.stop_ttfb_metrics()
+
+    async def _finish_utterance_metrics(self):
+        """Report speech-start-to-final latency and release deferred reconnects."""
+        await self._mark_first_transcript_received()
+        await self.stop_processing_metrics()
+        self._user_speaking = False
+        self._can_reconnect = True
+        if self._need_reconnect:
+            self.create_task(self._reconnect(), name="sarvam-realtime-settings-reconnect")
+
     def _language_for_message(self, message: dict[str, Any]) -> Language | None:
         language_code = message.get("language")
         if not language_code:
@@ -573,6 +563,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         if not text:
             return
 
+        await self._mark_first_transcript_received()
         await self.push_frame(
             InterimTranscriptionFrame(
                 text,
@@ -586,9 +577,10 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
     async def _handle_final_transcript(self, message: dict[str, Any]):
         text = str(message.get("text", "")).strip()
         if not text:
-            await self.stop_processing_metrics()
+            await self._finish_utterance_metrics()
             return
 
+        await self._mark_first_transcript_received()
         language = self._language_for_message(message)
         await self._trace_transcription(text, True, language)
         await self.emit_stt_usage_metrics()
@@ -602,7 +594,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
                 finalized=True,
             )
         )
-        await self.stop_processing_metrics()
+        await self._finish_utterance_metrics()
 
     def _frame_result(self, message: dict[str, Any]) -> dict[str, Any]:
         result = dict(message)
@@ -619,6 +611,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         await self.push_error(str(error), exception=error, fatal=fatal)
         if fatal:
             self._disconnecting = True
+            self._ttft_pending = False
             await self.stop_all_metrics()
             await self._call_event_handler("on_connection_error", str(error))
             raise error
@@ -652,13 +645,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         if not changed:
             return changed
 
-        reconnect_fields = {"prefix_padding_ms", "return_timestamps"}
-        reset_to_default_fields = {
-            field_name
-            for field_name in ("threshold", "silence_duration_ms", "min_speech_duration_ms")
-            if field_name in changed and getattr(self._settings, field_name) is None
-        }
-        reconnect_fields.update(reset_to_default_fields)
+        reconnect_fields: set[str] = set()
         old_stream_type = changed.get("stream_type")
         new_stream_type = self._settings.stream_type
         if old_stream_type is not None and (
@@ -675,14 +662,8 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             "stream_type",
             "endpointing",
             "mode",
-            "prompt",
-            "threshold",
-            "silence_duration_ms",
-            "min_speech_duration_ms",
         }
         update = {key: getattr(self._settings, key) for key in changed.keys() & live_fields}
-        if "prompt" in update and update["prompt"] is None:
-            update["prompt"] = ""
         if update and self._websocket and self._websocket.state is State.OPEN:
             await self._send_json({"event": "config.update", **update})
 

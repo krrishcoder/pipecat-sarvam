@@ -50,7 +50,8 @@ stt = SarvamRealtimeSTTService(
         stream_type="fast",
         endpointing="vad",
         mode="transcribe",
-        return_timestamps=True,
+        encoding="linear16",
+        sample_rate=16000,
     ),
 )
 ```
@@ -59,18 +60,25 @@ Insert `stt` after `transport.input()` in a normal Pipecat pipeline. Server VAD
 is advertised through `STTMetadataFrame` as the external user-turn strategy.
 See `examples/realtime_stt.py` for service construction.
 
-Supported input encodings are `linear16`, `linear32`, `mulaw`, and `alaw` at
-8 kHz or 16 kHz. Pipecat audio bytes must already match the configured
-encoding; the service does not transcode them.
+The initial public settings are deliberately limited to `language_code`,
+`mode`, `stream_type`, `endpointing`, `encoding`, and `sample_rate`. Input is
+mono linear16 PCM at 8 kHz or 16 kHz; unsupported encodings fail during
+construction rather than sending mislabeled audio.
 
 Runtime-supported settings can be changed without replacing the service:
 
 ```python
-await stt.update_config(mode="codemix", threshold=0.4)
+await stt.update_config(mode="codemix")
 ```
 
 The model is locked to `saaras:v3-realtime`. Input encoding and sample rate
 cannot be changed after construction.
+
+With Pipecat metrics enabled, Sarvam `vad.speech_start` starts both latency
+clocks. The first non-empty partial (or final when no partial arrives) emits
+TTFB as time to first transcript; the final transcript emits processing time as
+speech-start-to-final latency. Server-owned endpointing is also advertised with
+an `STTMetadataFrame` and external user-turn strategies.
 
 ## Raw protocol verification
 

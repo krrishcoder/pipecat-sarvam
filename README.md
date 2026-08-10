@@ -3,20 +3,21 @@
 Community-maintained Sarvam AI integration for
 [Pipecat](https://github.com/pipecat-ai/pipecat).
 
-The first planned service is `SarvamRealtimeSTTService`, a streaming
+The first service is `SarvamRealtimeSTTService`, a streaming
 speech-to-text adapter for Sarvam's `saaras:v3-realtime` WebSocket API.
 
 > [!NOTE]
-> This repository is currently an implementation scaffold. The realtime
-> service is not usable yet.
+> This is an early community integration tested with `pipecat-ai` 1.7.0.
 
-## Planned features
+## Features
 
 - Streaming PCM audio to Sarvam over WebSocket
 - Interim and final Pipecat transcription frames
-- Server-side VAD and user speaking frames
+- Server-side or manual endpointing
+- Server VAD mapped to Pipecat user-speaking frames
 - Barge-in/interruption support
-- Metrics, errors, and connection lifecycle handling
+- Runtime `config.update` support
+- Metrics, keepalive, errors, reconnects, and graceful session shutdown
 
 ## Development setup
 
@@ -29,41 +30,96 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-Run the tests:
-
-```bash
-pytest
-```
-
-## Configuration
-
-The completed service will read the Sarvam API key from the constructor. Keep
-the key in an environment variable and never commit it:
+Keep the API key in an environment variable or an ignored `.env` file:
 
 ```bash
 export SARVAM_API_KEY="your-api-key"
 ```
 
-## Planned usage
-
-After the service is implemented, it will be importable as:
+## Usage
 
 ```python
+import os
+
 from pipecat_sarvam import SarvamRealtimeSTTService
+
+stt = SarvamRealtimeSTTService(
+    api_key=os.environ["SARVAM_API_KEY"],
+    settings=SarvamRealtimeSTTService.Settings(
+        language_code="hi-IN",
+        stream_type="fast",
+        endpointing="vad",
+        mode="transcribe",
+        return_timestamps=True,
+    ),
+)
 ```
 
-See `examples/realtime_stt.py` for the foundational example as it is developed.
+Insert `stt` after `transport.input()` in a normal Pipecat pipeline. Server VAD
+is advertised through `STTMetadataFrame` as the external user-turn strategy.
+See `examples/realtime_stt.py` for service construction.
+
+Supported input encodings are `linear16`, `linear32`, `mulaw`, and `alaw` at
+8 kHz or 16 kHz. Pipecat audio bytes must already match the configured
+encoding; the service does not transcode them.
+
+Runtime-supported settings can be changed without replacing the service:
+
+```python
+await stt.update_config(mode="codemix", threshold=0.4)
+```
+
+The model is locked to `saaras:v3-realtime`. Input encoding and sample rate
+cannot be changed after construction.
+
+## Raw protocol verification
+
+The provider-only diagnostic client has no Pipecat imports. It safely reads
+`SARVAM_API_KEY` from the environment or `.env`, validates mono linear16 audio,
+streams in real time, and records every server event:
+
+```bash
+python examples/raw_realtime_stt.py test_audio/hindi.wav --dry-run
+python examples/raw_realtime_stt.py test_audio/hindi.wav --return-timestamps
+```
+
+Events are written to the ignored
+`artifacts/sarvam-realtime-events.jsonl` file. The live protocol returned:
+
+- `session.begin` with resolved configuration and `request_id`
+- `vad.speech_start` and `vad.speech_end` with `utterance_idx`
+- `transcript.partial` with `text`
+- `transcript.final` with `text`, `start_s`, and `end_s`
+- `session.end` with audio/session duration and utterance count
+- `error` with `code`, `message`, `is_fatal`, and constraint metadata
+
+For `stream_type=fast`, the live endpoint reported a 16,000-byte per-frame cap
+for 16 kHz linear16 input. It also resolved `silence_duration_ms` to 1000 when
+the parameter was omitted.
+
+## Tests
+
+Run local tests:
+
+```bash
+pytest
+```
+
+Run the opt-in live adapter test:
+
+```bash
+RUN_SARVAM_INTEGRATION=1 pytest -q -s tests/test_live_realtime_stt.py
+```
 
 ## Compatibility
 
-Pipecat compatibility will be documented after the first working
-implementation is tested against a released `pipecat-ai` version.
+Tested with Python 3.12, `pipecat-ai` 1.7.0, and `websockets` 17.0.1.
 
 ## Project status
 
 The source code is intended to remain in this community repository. A separate
 documentation pull request can register the integration in Pipecat's supported
-services catalog once the implementation, example, and tests are complete.
+services catalog after broader testing and review.
 
 ## License
 

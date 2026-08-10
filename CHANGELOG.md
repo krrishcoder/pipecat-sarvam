@@ -10,3 +10,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Added
 
 - Initial Python package, example, and test structure.
+- Raw Sarvam realtime WebSocket protocol probe with WAV/PCM validation.
+- `SarvamRealtimeSTTService` with typed settings, server VAD, transcript frame
+  mapping, interruption support, metrics, keepalive, reconnection, runtime
+  updates, graceful shutdown, and error handling.
+- Unit and opt-in live integration tests.

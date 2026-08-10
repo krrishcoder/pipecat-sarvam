@@ -20,6 +20,11 @@ htmlcov/
 .env.*
 !.env.example
 
+# Local audio fixtures and captured provider events
+test_audio/*
+!test_audio/README.md
+artifacts/
+
 # Editors and operating systems
 .DS_Store
 .idea/

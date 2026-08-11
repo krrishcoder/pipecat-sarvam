@@ -20,8 +20,8 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-  "pipecat-ai",
-  "websockets",
+  "pipecat-ai>=1.7.0",
+  "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +43,9 @@ packages = ["src/pipecat_sarvam"]
 addopts = "-ra"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+  "integration: opt-in tests that call the live Sarvam API",
+]
 
 [tool.ruff]
 line-length = 100

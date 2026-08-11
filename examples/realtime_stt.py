@@ -1,17 +1,29 @@
-"""Foundational Sarvam realtime STT example.
+"""Construct Sarvam realtime STT for use in a Pipecat pipeline."""
 
-This file will contain a minimal Pipecat pipeline after
-``SarvamRealtimeSTTService`` is implemented.
-"""
+import os
+
+from pipecat_sarvam import SarvamRealtimeSTTService
 
 
-def main() -> None:
-    """Explain why the scaffold example cannot run yet."""
-    raise SystemExit(
-        "SarvamRealtimeSTTService is not implemented yet. "
-        "Implement the raw WebSocket protocol and service adapter first."
+def create_stt() -> SarvamRealtimeSTTService:
+    """Create the service that can be inserted into a Pipecat pipeline."""
+    api_key = os.getenv("SARVAM_API_KEY")
+    if not api_key:
+        raise RuntimeError("Export SARVAM_API_KEY before creating the service")
+
+    return SarvamRealtimeSTTService(
+        api_key=api_key,
+        settings=SarvamRealtimeSTTService.Settings(
+            language_code="hi-IN",
+            stream_type="fast",
+            endpointing="vad",
+            mode="transcribe",
+            encoding="linear16",
+            sample_rate=16000,
+        ),
     )
 
 
 if __name__ == "__main__":
-    main()
+    stt = create_stt()
+    print(f"Created {stt.name}; add it after transport.input() in a Pipecat pipeline.")

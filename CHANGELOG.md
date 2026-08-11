@@ -14,4 +14,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `SarvamRealtimeSTTService` with typed settings, server VAD, transcript frame
   mapping, interruption support, metrics, keepalive, reconnection, runtime
   updates, graceful shutdown, and error handling.
+- Bounded retry and fatal termination policies for connection failures,
+  malformed messages, session timeouts, and unexpected session termination.
 - Unit and opt-in live integration tests.

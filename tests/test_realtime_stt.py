@@ -18,19 +18,26 @@ from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from websockets.protocol import State
 
 import pipecat_sarvam
-from pipecat_sarvam import SarvamRealtimeSTTService
+from pipecat_sarvam import SarvamRealtimeSTTError, SarvamRealtimeSTTService
 
 
 class RecordingWebSocket:
     """Minimal open WebSocket used by send-path tests."""
 
-    state = State.OPEN
-
-    def __init__(self) -> None:
+    def __init__(self, incoming: list[str] | None = None) -> None:
+        self.state = State.OPEN
         self.messages: list[str] = []
+        self.incoming = incoming or []
 
     async def send(self, message: str) -> None:
         self.messages.append(message)
+
+    async def close(self) -> None:
+        self.state = State.CLOSED
+
+    async def __aiter__(self):
+        for message in self.incoming:
+            yield message
 
 
 def test_package_exports_realtime_service() -> None:
@@ -230,3 +237,221 @@ async def test_live_setting_update_uses_config_update() -> None:
         "event": "config.update",
         "mode": "codemix",
     }
+
+
+@pytest.mark.asyncio
+async def test_initial_connection_failure_retries_then_terminates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initial handshakes should retry finitely and end with a fatal error."""
+    service = SarvamRealtimeSTTService(
+        api_key="test-key",
+        max_reconnect_attempts=3,
+        keepalive_timeout=None,
+    )
+    service._websocket_connect = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ConnectionError("network unavailable")
+    )
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+    service.stop_all_metrics = AsyncMock()  # type: ignore[method-assign]
+    service._call_event_handler = AsyncMock()  # type: ignore[method-assign]
+    monkeypatch.setattr("pipecat_sarvam.realtime_stt.asyncio.sleep", AsyncMock())
+
+    with pytest.raises(ConnectionError, match="network unavailable"):
+        await service._connect()
+
+    assert service._websocket_connect.await_count == 3
+    assert service.push_error.await_count == 3
+    assert service.push_error.await_args_list[-1].kwargs["fatal"] is True
+    assert service._disconnecting
+
+
+@pytest.mark.asyncio
+async def test_sarvam_api_errors_are_reported_and_fatal_errors_terminate() -> None:
+    """Non-fatal API errors continue; fatal API errors stop the connection."""
+    service = SarvamRealtimeSTTService(api_key="test-key")
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+    service.stop_all_metrics = AsyncMock()  # type: ignore[method-assign]
+    service._call_event_handler = AsyncMock()  # type: ignore[method-assign]
+
+    await service._handle_error(
+        {
+            "event": "error",
+            "code": "chunk_too_large",
+            "message": "frame exceeds cap",
+            "is_fatal": False,
+        }
+    )
+
+    with pytest.raises(SarvamRealtimeSTTError, match="invalid_api_key"):
+        await service._handle_error(
+            {
+                "event": "error",
+                "code": "invalid_api_key",
+                "message": "authentication failed",
+                "is_fatal": True,
+            }
+        )
+
+    assert service.push_error.await_count == 2
+    assert service.push_error.await_args_list[0].kwargs.get("fatal", False) is False
+    assert service.push_error.await_args_list[1].kwargs["fatal"] is True
+    assert service._disconnecting
+
+
+@pytest.mark.asyncio
+async def test_repeated_malformed_messages_report_then_terminate() -> None:
+    """Protocol corruption must not be logged and silently ignored forever."""
+    service = SarvamRealtimeSTTService(api_key="test-key")
+    websocket = RecordingWebSocket(["not-json", "[]", '{"missing": "event"}'])
+    service._websocket = websocket  # type: ignore[assignment]
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+    service.stop_all_metrics = AsyncMock()  # type: ignore[method-assign]
+    service._call_event_handler = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(SarvamRealtimeSTTError, match="Malformed"):
+        await service._receive_messages()
+
+    assert service.push_error.await_count == 3
+    assert service.push_error.await_args_list[-1].kwargs["fatal"] is True
+    assert websocket.state is State.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_session_ready_timeout_terminates_when_reconnect_is_disabled() -> None:
+    """Timed-out sessions must fail fatally instead of dropping audio."""
+    service = SarvamRealtimeSTTService(
+        api_key="test-key",
+        reconnect_on_error=False,
+        session_ready_timeout=0.001,
+    )
+    websocket = RecordingWebSocket()
+    service._websocket = websocket  # type: ignore[assignment]
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+    service.stop_all_metrics = AsyncMock()  # type: ignore[method-assign]
+    service._call_event_handler = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(SarvamRealtimeSTTError, match="session.begin"):
+        async for _ in service.run_stt(b"\x00\x00"):
+            pass
+
+    assert service.push_error.await_args.kwargs["fatal"] is True
+    assert websocket.state is State.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_session_ready_timeout_recovers_once_when_enabled() -> None:
+    """A readiness timeout should reconnect once before failing the session."""
+    service = SarvamRealtimeSTTService(
+        api_key="test-key",
+        session_ready_timeout=0.001,
+    )
+    service._report_recoverable_error = AsyncMock()  # type: ignore[method-assign]
+
+    async def recover(reason: str) -> bool:
+        assert reason == "session.begin timeout"
+        service._session_ready.set()
+        return True
+
+    service._recover_connection = recover  # type: ignore[method-assign]
+
+    await service._ensure_session_ready()
+
+    service._report_recoverable_error.assert_awaited_once()
+    assert service._session_ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_session_end_requests_reconnect() -> None:
+    """Provider session termination should enter the dropped-connection path."""
+    service = SarvamRealtimeSTTService(api_key="test-key")
+    service._report_recoverable_error = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(SarvamRealtimeSTTError, match="ended unexpectedly"):
+        await service._handle_message(
+            {
+                "event": "session.end",
+                "request_id": "request-123",
+                "audio_duration_s": 12.5,
+            }
+        )
+
+    assert service._session_ended.is_set()
+    service._report_recoverable_error.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dropped_connection_exhaustion_emits_fatal_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropped sockets should terminate after the configured reconnect budget."""
+    service = SarvamRealtimeSTTService(
+        api_key="test-key",
+        max_reconnect_attempts=2,
+        keepalive_timeout=None,
+    )
+    service._reconnect_websocket = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ConnectionError("still offline")
+    )
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+    service.stop_all_metrics = AsyncMock()  # type: ignore[method-assign]
+    service._call_event_handler = AsyncMock()  # type: ignore[method-assign]
+    report_error = AsyncMock()
+    monkeypatch.setattr("pipecat.services.websocket_service.asyncio.sleep", AsyncMock())
+
+    recovered = await service._maybe_try_reconnect(
+        "Sarvam connection dropped",
+        report_error,
+        ConnectionError("socket closed"),
+    )
+
+    assert not recovered
+    assert service._reconnect_websocket.await_count == 2
+    assert service.push_error.await_args.kwargs["fatal"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_failure_recovers_and_retries_message_once() -> None:
+    """A transient failed audio send should reconnect and resend exactly once."""
+    service = SarvamRealtimeSTTService(api_key="test-key")
+    failed_websocket = RecordingWebSocket()
+    failed_websocket.send = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ConnectionError("send failed")
+    )
+    recovered_websocket = RecordingWebSocket()
+    service._websocket = failed_websocket  # type: ignore[assignment]
+    service._report_recoverable_error = AsyncMock()  # type: ignore[method-assign]
+
+    async def recover(reason: str) -> bool:
+        assert reason == "send failure"
+        service._websocket = recovered_websocket  # type: ignore[assignment]
+        service._session_ready.set()
+        return True
+
+    service._recover_connection = recover  # type: ignore[method-assign]
+
+    await service._send_json({"event": "audio_input", "audio": "AA=="})
+
+    service._report_recoverable_error.assert_awaited_once()
+    assert len(recovered_websocket.messages) == 1
+    assert json.loads(recovered_websocket.messages[0])["event"] == "audio_input"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_session_timeout_is_reported() -> None:
+    """Missing session.end acknowledgements should produce a visible error."""
+    service = SarvamRealtimeSTTService(
+        api_key="test-key",
+        session_end_timeout=0.001,
+        keepalive_timeout=None,
+    )
+    websocket = RecordingWebSocket()
+    service._websocket = websocket  # type: ignore[assignment]
+    service.push_error = AsyncMock()  # type: ignore[method-assign]
+    service._call_event_handler = AsyncMock()  # type: ignore[method-assign]
+
+    await service._disconnect()
+
+    service.push_error.assert_awaited_once()
+    assert "session.end" in service.push_error.await_args.args[0]
+    assert websocket.state is State.CLOSED

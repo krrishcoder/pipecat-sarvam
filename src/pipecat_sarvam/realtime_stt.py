@@ -6,13 +6,14 @@ import asyncio
 import base64
 import copy
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
 
 from loguru import logger
 from pipecat.frames.frames import (
+    ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
     StartFrame,
@@ -35,6 +36,7 @@ from pipecat.services.stt_latency import SARVAM_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
+from pipecat.utils.network import exponential_backoff_time
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 from websockets.protocol import State
@@ -111,6 +113,7 @@ _MAX_CHUNK_DURATION_SECONDS = {
     "balanced": 1.0,
     "simulated": 1.0,
 }
+_MAX_CONSECUTIVE_MALFORMED_MESSAGES = 3
 
 _LANGUAGE_TO_SARVAM = {
     Language.AS_IN: "as-IN",
@@ -180,6 +183,9 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         sample_rate: int = 16000,
         settings: Settings | None = None,
         should_interrupt: bool = True,
+        reconnect_on_error: bool = True,
+        max_reconnect_attempts: int = 3,
+        connection_timeout: float = 10.0,
         session_end_timeout: float = 0.5,
         session_ready_timeout: float = 10.0,
         ttfs_p99_latency: float | None = SARVAM_TTFS_P99,
@@ -195,6 +201,9 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             sample_rate: Input sample rate, either 8000 or 16000 Hz.
             settings: Typed Sarvam realtime settings.
             should_interrupt: Broadcast an interruption on server VAD speech start.
+            reconnect_on_error: Recover transient connection loss when enabled.
+            max_reconnect_attempts: Maximum attempts per connection or reconnect cycle.
+            connection_timeout: Maximum seconds for the WebSocket handshake.
             session_end_timeout: Grace period for ``session.end`` during shutdown.
             session_ready_timeout: Maximum wait for ``session.begin`` before audio.
             ttfs_p99_latency: Pipecat STT latency metadata value.
@@ -204,6 +213,12 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         """
         if not api_key:
             raise ValueError("api_key must not be empty")
+        if max_reconnect_attempts < 1:
+            raise ValueError("max_reconnect_attempts must be at least 1")
+        if connection_timeout <= 0:
+            raise ValueError("connection_timeout must be greater than zero")
+        if session_ready_timeout <= 0:
+            raise ValueError("session_ready_timeout must be greater than zero")
 
         default_settings = self.Settings(
             model=SARVAM_REALTIME_MODEL,
@@ -238,17 +253,21 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             ttfs_p99_latency=ttfs_p99_latency,
             keepalive_timeout=keepalive_timeout,
             keepalive_interval=keepalive_interval,
+            reconnect_on_error=reconnect_on_error,
             **kwargs,
         )
 
         self._api_key = api_key
         self._base_url = base_url
         self._should_interrupt = should_interrupt
+        self._max_reconnect_attempts = max_reconnect_attempts
+        self._connection_timeout = connection_timeout
         self._session_end_timeout = session_end_timeout
         self._session_ready_timeout = session_ready_timeout
 
         self._receive_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
+        self._recovery_lock = asyncio.Lock()
         self._connect_complete = asyncio.Event()
         self._connect_complete.set()
         self._session_ready = asyncio.Event()
@@ -256,6 +275,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         self._request_id: str | None = None
         self._session_end_data: dict[str, Any] | None = None
         self._ttft_pending = False
+        self._consecutive_malformed_messages = 0
 
     @staticmethod
     def _validate_settings(settings: Settings) -> None:
@@ -337,18 +357,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         if not self._websocket or self._websocket.state is not State.OPEN:
             await self._connect()
 
-        try:
-            await asyncio.wait_for(
-                self._session_ready.wait(),
-                timeout=self._session_ready_timeout,
-            )
-        except TimeoutError as error:
-            await self.push_error(
-                "Timed out waiting for Sarvam realtime session.begin",
-                exception=error,
-            )
-            yield None
-            return
+        await self._ensure_session_ready()
 
         encoding = assert_given(self._settings.encoding)
         stream_type = assert_given(self._settings.stream_type)
@@ -399,7 +408,22 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             self._connect_complete.clear()
             try:
                 await super()._connect()
-                await self._connect_websocket()
+                attempts = self._max_reconnect_attempts if self._reconnect_on_error else 1
+                for attempt in range(1, attempts + 1):
+                    try:
+                        await self._connect_websocket()
+                        break
+                    except Exception as error:
+                        message = (
+                            f"Unable to connect to Sarvam realtime STT "
+                            f"(attempt {attempt}/{attempts}): {error}"
+                        )
+                        if attempt == attempts:
+                            await self._terminate_connection(message, exception=error)
+                            raise
+                        await self._report_recoverable_error(message, exception=error)
+                        await asyncio.sleep(exponential_backoff_time(attempt))
+
                 if self._websocket and (self._receive_task is None or self._receive_task.done()):
                     self._receive_task = self.create_task(
                         self._receive_task_handler(self._report_error),
@@ -420,10 +444,17 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
                     self._session_ended.wait(),
                     timeout=self._session_end_timeout,
                 )
-            except TimeoutError:
-                logger.debug(f"{self} timed out waiting for Sarvam session.end")
+            except TimeoutError as error:
+                message = (
+                    f"Timed out after {self._session_end_timeout:g}s waiting for "
+                    "Sarvam realtime session.end during shutdown"
+                )
+                logger.warning(f"{self} {message}")
+                await self.push_error(message, exception=error)
             except Exception as error:
-                logger.debug(f"{self} error ending Sarvam session: {error}")
+                message = f"Error ending Sarvam realtime session: {error}"
+                logger.warning(f"{self} {message}")
+                await self.push_error(message, exception=error)
 
         if self._receive_task:
             await self.cancel_task(self._receive_task)
@@ -441,19 +472,12 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         self._request_id = None
         self._session_end_data = None
 
-        try:
-            self._websocket = await self._websocket_connect(
-                self._build_websocket_url(),
-                additional_headers={"API-SUBSCRIPTION-KEY": self._api_key},
-                ping_interval=None,
-            )
-        except Exception as error:
-            self._websocket = None
-            await self.push_error(
-                f"Unable to connect to Sarvam realtime STT: {error}",
-                exception=error,
-            )
-            raise
+        self._websocket = await self._websocket_connect(
+            self._build_websocket_url(),
+            additional_headers={"API-SUBSCRIPTION-KEY": self._api_key},
+            open_timeout=self._connection_timeout,
+            ping_interval=None,
+        )
 
         await self._call_event_handler("on_connected")
 
@@ -472,6 +496,139 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             self._session_ready.clear()
             await self._call_event_handler("on_disconnected")
 
+    async def _report_recoverable_error(
+        self,
+        message: str,
+        *,
+        exception: Exception | None = None,
+    ):
+        """Report an error that the configured recovery policy will retry."""
+        logger.warning(f"{self} {message}")
+        await self._call_event_handler("on_connection_error", message)
+        await self.push_error(message, exception=exception)
+
+    async def _terminate_connection(
+        self,
+        message: str,
+        *,
+        exception: Exception | None = None,
+    ):
+        """Stop recovery and emit a fatal Pipecat error."""
+        if self._disconnecting:
+            return
+
+        logger.error(f"{self} {message}")
+        self._disconnecting = True
+        self._session_ready.clear()
+        self._session_ended.set()
+        self._ttft_pending = False
+        await self.stop_all_metrics()
+        await self._call_event_handler("on_connection_error", message)
+        await self.push_error(message, exception=exception, fatal=True)
+        await self._disconnect_websocket()
+
+    async def _ensure_session_ready(self):
+        """Wait for ``session.begin`` and recover one timed-out session."""
+        if self._session_ready.is_set():
+            return
+
+        try:
+            await asyncio.wait_for(
+                self._session_ready.wait(),
+                timeout=self._session_ready_timeout,
+            )
+            return
+        except TimeoutError as error:
+            message = (
+                f"Timed out after {self._session_ready_timeout:g}s waiting for "
+                "Sarvam realtime session.begin"
+            )
+            if not self._reconnect_on_error:
+                await self._terminate_connection(message, exception=error)
+                raise SarvamRealtimeSTTError(message) from error
+            await self._report_recoverable_error(
+                f"{message}; reconnecting once",
+                exception=error,
+            )
+
+        if not await self._recover_connection("session.begin timeout"):
+            raise SarvamRealtimeSTTError("Unable to recover timed-out Sarvam session")
+
+    async def _recover_connection(self, reason: str) -> bool:
+        """Perform a full service reconnect outside the receive task."""
+        async with self._recovery_lock:
+            if (
+                self._websocket
+                and self._websocket.state is State.OPEN
+                and self._session_ready.is_set()
+            ):
+                return True
+
+            self._reconnecting = True
+            try:
+                await self._do_reconnect()
+                await asyncio.wait_for(
+                    self._session_ready.wait(),
+                    timeout=self._session_ready_timeout,
+                )
+                logger.info(f"{self} recovered connection after {reason}")
+                return True
+            except Exception as error:
+                message = f"Unable to recover Sarvam realtime connection after {reason}: {error}"
+                await self._terminate_connection(message, exception=error)
+                return False
+            finally:
+                self._reconnecting = False
+
+    async def _try_reconnect(
+        self,
+        max_retries: int | None = None,
+        report_error: Callable[[ErrorFrame], Awaitable[None]] | None = None,
+    ) -> bool:
+        """Use the adapter's bounded reconnect policy for dropped sockets."""
+        return await super()._try_reconnect(
+            max_retries=max_retries or self._max_reconnect_attempts,
+            report_error=report_error,
+        )
+
+    async def _maybe_try_reconnect(
+        self,
+        error_message: str,
+        report_error: Callable[[ErrorFrame], Awaitable[None]],
+        error: Exception | None = None,
+    ) -> bool:
+        """Reconnect dropped sockets or terminate after policy exhaustion."""
+        recovered = await super()._maybe_try_reconnect(
+            error_message,
+            report_error,
+            error,
+        )
+        if not recovered and not self._disconnecting:
+            await self._terminate_connection(
+                f"{error_message}; connection recovery stopped",
+                exception=error,
+            )
+        return recovered
+
+    async def _handle_malformed_message(
+        self,
+        reason: str,
+        *,
+        exception: Exception | None = None,
+    ):
+        """Report malformed messages and terminate after repeated violations."""
+        self._consecutive_malformed_messages += 1
+        message = (
+            f"Malformed Sarvam realtime message "
+            f"({self._consecutive_malformed_messages}/"
+            f"{_MAX_CONSECUTIVE_MALFORMED_MESSAGES}): {reason}"
+        )
+        if self._consecutive_malformed_messages >= _MAX_CONSECUTIVE_MALFORMED_MESSAGES:
+            error = SarvamRealtimeSTTError(message)
+            await self._terminate_connection(message, exception=exception or error)
+            raise error
+        await self._report_recoverable_error(message, exception=exception)
+
     async def _receive_messages(self):
         """Receive and dispatch Sarvam protocol events."""
         if self._websocket is None:
@@ -480,21 +637,61 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         async for message in self._websocket:
             try:
                 event = json.loads(message)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(f"{self} received a non-JSON message")
+            except (json.JSONDecodeError, TypeError) as error:
+                await self._handle_malformed_message(
+                    "message is not valid JSON",
+                    exception=error,
+                )
                 continue
+
+            if not isinstance(event, dict):
+                await self._handle_malformed_message(
+                    f"expected a JSON object, received {type(event).__name__}"
+                )
+                continue
+            if not isinstance(event.get("event"), str):
+                await self._handle_malformed_message("JSON object has no string event field")
+                continue
+
+            self._consecutive_malformed_messages = 0
             await self._handle_message(event)
 
     async def _send_json(self, message: dict[str, Any]):
-        """Send one protocol message over the open socket."""
-        if self._websocket is None or self._websocket.state is not State.OPEN:
-            raise ConnectionError("Sarvam realtime WebSocket is not open")
-        await self._websocket.send(json.dumps(message))
+        """Send one message, reconnecting once before retrying a failed send."""
+        payload = json.dumps(message)
+        try:
+            if self._websocket is None or self._websocket.state is not State.OPEN:
+                raise ConnectionError("Sarvam realtime WebSocket is not open")
+            await self._websocket.send(payload)
+            return
+        except Exception as error:
+            reason = f"Failed to send Sarvam {message.get('event', 'unknown')} event"
+            if not self._reconnect_on_error:
+                await self._terminate_connection(reason, exception=error)
+                raise SarvamRealtimeSTTError(reason) from error
+            await self._report_recoverable_error(
+                f"{reason}; reconnecting once",
+                exception=error,
+            )
+
+        if not await self._recover_connection("send failure"):
+            raise SarvamRealtimeSTTError("Unable to recover failed Sarvam send")
+
+        try:
+            if self._websocket is None or self._websocket.state is not State.OPEN:
+                raise ConnectionError("Sarvam realtime WebSocket is not open after recovery")
+            await self._websocket.send(payload)
+        except Exception as error:
+            reason = f"Failed to resend Sarvam {message.get('event', 'unknown')} event"
+            await self._terminate_connection(reason, exception=error)
+            raise SarvamRealtimeSTTError(reason) from error
 
     async def _send_keepalive(self, silence: bytes):
         """Send Sarvam's protocol ping instead of synthetic audio."""
         del silence
-        await self._send_json({"event": "ping"})
+        if self._websocket is None or self._websocket.state is not State.OPEN:
+            raise ConnectionError("Sarvam realtime WebSocket is not open")
+        await self._websocket.send(json.dumps({"event": "ping"}))
 
     async def _handle_message(self, message: dict[str, Any]):
         """Map one Sarvam event into Pipecat frames and state."""
@@ -520,7 +717,22 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             logger.debug(f"{self} Sarvam config updated: {message.get('applied', [])}")
         elif event == "session.end":
             self._session_end_data = message
+            self._session_ready.clear()
             self._session_ended.set()
+            if not self._disconnecting:
+                detail = (
+                    f"Sarvam realtime session ended unexpectedly after "
+                    f"{message.get('audio_duration_s', 'unknown')}s of audio"
+                )
+                error = SarvamRealtimeSTTError(detail)
+                if self._reconnect_on_error:
+                    await self._report_recoverable_error(
+                        f"{detail}; reconnecting",
+                        exception=error,
+                    )
+                else:
+                    await self._terminate_connection(detail, exception=error)
+                raise error
         elif event == "error":
             await self._handle_error(message)
         elif event != "pong":
@@ -608,13 +820,11 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         fatal = bool(message.get("is_fatal"))
         error = SarvamRealtimeSTTError(f"{code}: {detail}")
 
-        await self.push_error(str(error), exception=error, fatal=fatal)
         if fatal:
-            self._disconnecting = True
-            self._ttft_pending = False
-            await self.stop_all_metrics()
-            await self._call_event_handler("on_connection_error", str(error))
+            await self._terminate_connection(str(error), exception=error)
             raise error
+        logger.warning(f"{self} non-fatal Sarvam API error: {error}")
+        await self.push_error(str(error), exception=error)
 
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
         """Apply live settings with ``config.update`` or a deferred reconnect."""

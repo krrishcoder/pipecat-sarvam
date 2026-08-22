@@ -17,6 +17,7 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
+    InterruptionFrame,
     StartFrame,
     STTMetadataFrame,
     TranscriptionFrame,
@@ -45,6 +46,17 @@ from websockets.protocol import State
 SARVAM_REALTIME_MODEL = "saaras:v3-realtime"
 SARVAM_REALTIME_URL = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
 
+# Odia is spelled differently across Sarvam's own products. The realtime endpoint
+# accepts "or-IN" and rejects "od-IN" with a fatal invalid_request that enumerates its
+# supported values (verified against the live endpoint 2026-08-22), which happens to
+# agree with Pipecat's Language.OR_IN. Sarvam's other speech APIs — batch
+# transcription, the SDK's streaming STT, translation, text-to-speech, and language
+# identification — use "od-IN" instead, and that is what upstream Pipecat's
+# SarvamSTTService correctly sends to /speech-to-text/ws. Both spellings are accepted
+# as input here; the realtime one is what goes on the wire.
+SARVAM_REALTIME_ODIA_CODE = "or-IN"
+SARVAM_BATCH_ODIA_CODE = "od-IN"
+
 LanguageCode = Literal[
     "auto",
     "en-IN",
@@ -53,6 +65,7 @@ LanguageCode = Literal[
     "kn-IN",
     "ml-IN",
     "mr-IN",
+    "od-IN",
     "or-IN",
     "pa-IN",
     "ta-IN",
@@ -84,6 +97,7 @@ SUPPORTED_LANGUAGE_CODES = {
     "kn-IN",
     "ml-IN",
     "mr-IN",
+    "od-IN",
     "or-IN",
     "pa-IN",
     "ta-IN",
@@ -127,7 +141,7 @@ _LANGUAGE_TO_SARVAM = {
     Language.MAI_IN: "mai-IN",
     Language.ML_IN: "ml-IN",
     Language.MR_IN: "mr-IN",
-    Language.OR_IN: "or-IN",
+    Language.OR_IN: SARVAM_REALTIME_ODIA_CODE,
     Language.PA_IN: "pa-IN",
     Language.SD_IN: "sd-IN",
     Language.TA_IN: "ta-IN",
@@ -152,6 +166,10 @@ def sarvam_language_to_pipecat(language_code: str | None) -> Language | None:
     """Map a Sarvam language code to a Pipecat enum when one exists."""
     if not language_code or language_code == "auto":
         return None
+    if language_code == SARVAM_BATCH_ODIA_CODE:
+        # Language("od-IN") would raise. The realtime endpoint sends "or-IN", but
+        # accept Sarvam's other spelling defensively rather than drop the language.
+        return Language.OR_IN
     try:
         return Language(language_code)
     except ValueError:
@@ -165,6 +183,9 @@ def resolve_sarvam_language_code(language: Language | str) -> str:
     as ``ne-IN`` and ``sat-IN``. Those are passed through when supplied as plain
     strings instead of raising, so every advertised code stays reachable.
 
+    Odia is a special case: Sarvam's other speech APIs spell it ``od-IN``, which
+    this endpoint rejects, so ``od-IN`` is accepted and normalized to ``or-IN``.
+
     Args:
         language: A Pipecat ``Language`` member or a Sarvam language code.
 
@@ -176,14 +197,14 @@ def resolve_sarvam_language_code(language: Language | str) -> str:
     """
     if isinstance(language, Language):
         return language_to_sarvam_realtime_language(language)
+    if language == SARVAM_BATCH_ODIA_CODE:
+        return SARVAM_REALTIME_ODIA_CODE
     if language in SUPPORTED_LANGUAGE_CODES:
         return language
     try:
         return language_to_sarvam_realtime_language(Language(language))
     except ValueError as error:
-        raise ValueError(
-            f"Unsupported Sarvam realtime language: {language!r}"
-        ) from error
+        raise ValueError(f"Unsupported Sarvam realtime language: {language!r}") from error
 
 
 @dataclass
@@ -270,6 +291,9 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             ):
                 default_settings.language_code = resolve_sarvam_language_code(settings.language)
 
+        default_settings.language_code = self._normalize_language_code(
+            default_settings.language_code
+        )
         self._validate_settings(default_settings)
         resolved_sample_rate = assert_given(default_settings.sample_rate)
 
@@ -309,6 +333,19 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         self._terminated = False
         self._utterance_start_time = 0.0
         self._replaying_audio_buffer = False
+
+    @staticmethod
+    def _normalize_language_code(
+        language_code: LanguageCode | str | _NotGiven,
+    ) -> LanguageCode | str | _NotGiven:
+        """Rewrite Sarvam's other Odia spelling to the one this endpoint accepts.
+
+        Left untouched when the value is absent, so ``NOT_GIVEN`` still means
+        "no change" for a settings delta.
+        """
+        if language_code == SARVAM_BATCH_ODIA_CODE:
+            return SARVAM_REALTIME_ODIA_CODE
+        return language_code
 
     @staticmethod
     def _validate_settings(settings: Settings) -> None:
@@ -372,8 +409,16 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         await self._connect()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Forward local VAD boundaries when manual endpointing is configured."""
+        """Re-arm flushed utterance timers and forward local VAD boundaries."""
         await super().process_frame(frame, direction)
+
+        if isinstance(frame, InterruptionFrame):
+            # FrameProcessor.process_frame answers an InterruptionFrame with
+            # stop_all_metrics, which flushes an in-flight utterance measurement.
+            # Re-arm both timers against the original speech-start anchor so the
+            # reported latency still covers speech start to first transcript.
+            await self._rearm_utterance_metrics()
+            return
 
         if self._settings.endpointing != "manual":
             return
@@ -787,10 +832,16 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             self._session_ready.set()
             logger.info(f"{self} Sarvam session started request_id={self._request_id}")
         elif event == "vad.speech_start":
-            await self._begin_utterance_metrics()
+            # broadcast_interruption calls stop_all_metrics, so anchor the
+            # measurement before broadcasting and only start the timers once the
+            # interruption has been dispatched. Otherwise both timers are flushed
+            # microseconds after they start and report internal overhead instead
+            # of the latency to the first transcript.
+            anchor = time.time()
             await self.broadcast_frame(UserStartedSpeakingFrame)
             if self._should_interrupt:
                 await self.broadcast_interruption()
+            await self._begin_utterance_metrics(start_time=anchor)
         elif event == "vad.speech_end":
             self._user_speaking = False
             await self.broadcast_frame(UserStoppedSpeakingFrame)
@@ -823,17 +874,36 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         elif event != "pong":
             logger.debug(f"{self} unhandled Sarvam event: {message}")
 
-    async def _begin_utterance_metrics(self):
-        """Start first-transcript and final-transcript latency measurements."""
+    async def _begin_utterance_metrics(self, start_time: float | None = None):
+        """Start first-transcript and final-transcript latency measurements.
+
+        Args:
+            start_time: Wall-clock anchor for both measurements; defaults to now.
+                Callers that broadcast an interruption for the same speech start
+                must capture the anchor *before* broadcasting and pass it here,
+                because ``FrameProcessor.broadcast_interruption`` calls
+                ``stop_all_metrics`` and would otherwise flush these timers.
+        """
         await self._reset_stt_ttfb_state()
         self._user_speaking = True
         self._can_reconnect = False
         self._ttft_pending = True
         # Recorded on the same wall clock the metrics collector uses so the
         # anchor can be restored if the base class re-anchors TTFB later.
-        self._utterance_start_time = time.time()
+        self._utterance_start_time = time.time() if start_time is None else start_time
         await self.start_ttfb_metrics(start_time=self._utterance_start_time)
-        await self.start_processing_metrics()
+        await self.start_processing_metrics(start_time=self._utterance_start_time)
+
+    async def _rearm_utterance_metrics(self):
+        """Restart utterance timers that an interruption flushed prematurely.
+
+        No-op unless an utterance measurement is still pending, so an interruption
+        that arrives between utterances cannot resurrect a finished measurement.
+        """
+        if not self._ttft_pending or not self._utterance_start_time:
+            return
+        await self.start_ttfb_metrics(start_time=self._utterance_start_time)
+        await self.start_processing_metrics(start_time=self._utterance_start_time)
 
     async def _mark_first_transcript_received(self):
         """Report latency to the first non-empty interim or final transcript."""
@@ -944,6 +1014,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         )
         if derive_language_code:
             candidate.language_code = resolve_sarvam_language_code(delta.language)
+        candidate.language_code = self._normalize_language_code(candidate.language_code)
         self._validate_settings(candidate)
 
         changed = await super()._update_settings(delta)
@@ -951,6 +1022,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             previous_language_code = self._settings.language_code
             self._settings.language_code = resolve_sarvam_language_code(self._settings.language)
             changed.setdefault("language_code", previous_language_code)
+        self._settings.language_code = self._normalize_language_code(self._settings.language_code)
 
         if not changed:
             return changed

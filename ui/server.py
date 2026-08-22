@@ -59,20 +59,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from examples.raw_realtime_stt import get_api_key  # noqa: E402
-from pipecat_sarvam import SarvamRealtimeSTTService  # noqa: E402
+from pipecat_sarvam import SUPPORTED_LANGUAGE_CODES, SarvamRealtimeSTTService  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 WEBSOCKET_PATHS = {"/ws", "/ws/"}
 
-# Mirrors the validation in SarvamRealtimeSTTService so the UI cannot open a
-# connection the service would reject anyway.
+# Reuses the service's own constant so the UI cannot open a connection the
+# service would reject anyway, and cannot drift from it either.
 ALLOWED_SETTINGS = {
-    "language_code": {
-        "auto", "as-IN", "bn-IN", "brx-IN", "doi-IN", "en-IN", "gu-IN", "hi-IN",
-        "kn-IN", "kok-IN", "ks-IN", "mai-IN", "ml-IN", "mni-IN", "mr-IN",
-        "ne-IN", "or-IN", "pa-IN", "sa-IN", "sat-IN", "sd-IN", "ta-IN",
-        "te-IN", "ur-IN",
-    },
+    "language_code": SUPPORTED_LANGUAGE_CODES,
     "mode": {"transcribe", "translate", "verbatim", "translit", "codemix"},
     "stream_type": {"fast", "balanced", "simulated"},
     "endpointing": {"vad", "manual"},

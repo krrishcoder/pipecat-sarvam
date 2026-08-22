@@ -9,6 +9,36 @@ Uses Sarvam's `saaras:v3-realtime` model through the realtime WebSocket API.
 > This is an early community integration. It is not an official Pipecat or
 > Sarvam package.
 
+## Relationship to Pipecat's built-in Sarvam STT
+
+Pipecat 1.7.0 already ships `pipecat.services.sarvam.stt.SarvamSTTService`, and
+it is also WebSocket-based. This package is not a replacement for it; it targets
+a different Sarvam endpoint that the built-in service cannot reach.
+
+`SarvamSTTService` goes through the `sarvamai` SDK
+(`speech_to_text_streaming.connect`), which resolves to
+`wss://api.sarvam.ai/speech-to-text/ws`. That SDK, as of 0.1.28, has no
+realtime client at all, so the built-in service cannot address
+`wss://api.sarvam.ai/speech-to-text-realtime/ws` or the `saaras:v3-realtime`
+model — it validates `model` against `saarika:v2.5`, `saaras:v2.5`, and
+`saaras:v3` and rejects anything else. Reaching the realtime endpoint requires
+speaking its protocol directly, which is what this package does.
+
+The practical differences that follow from that:
+
+| | `SarvamSTTService` (upstream) | `SarvamRealtimeSTTService` |
+| --- | --- | --- |
+| Endpoint | `/speech-to-text/ws` via `sarvamai` | `/speech-to-text-realtime/ws` direct |
+| Models | `saarika:v2.5`, `saaras:v2.5`, `saaras:v3` | `saaras:v3-realtime` |
+| Partial transcripts | none; emits `TranscriptionFrame` only | `InterimTranscriptionFrame` per partial |
+| Reconnection | none; a connect failure pushes an error and leaves the socket unset | bounded reconnect, backoff, send retry, buffered-audio replay |
+| Language codes | 13 mapped, silent fallback to Hindi | 24 codes, explicit error on unsupported input |
+| Dependencies | `pipecat-ai[sarvam]` → `sarvamai==0.1.28` | `websockets` only |
+
+Use the built-in service for batch-shaped or translation workloads on the
+established endpoint. Use this one when you need partial transcripts for
+low-latency barge-in.
+
 ## Features
 
 - Streaming speech-to-text without audio accumulation
@@ -153,6 +183,11 @@ codes:
 Not every code has a corresponding Pipecat `Language` enum in Pipecat 1.7.0.
 Those codes remain usable through the service's `language_code` setting.
 
+Odia is the one code where Sarvam's own products disagree. This realtime endpoint
+accepts `or-IN` and rejects `od-IN`, while Sarvam's batch, SDK-streaming,
+translation, and text-to-speech APIs use `od-IN`. The service accepts either
+spelling and sends `or-IN`.
+
 ## Connection and error policy
 
 Recovery is explicit and bounded:
@@ -187,7 +222,8 @@ older Pipecat versions is not provided.
 - Audio input is mono linear16 PCM at 8 kHz or 16 kHz. The adapter does not yet
   transcode linear32, mu-law, or A-law input.
 - The adapter uses Sarvam's WebSocket protocol directly because the tested
-  Sarvam Python SDK does not expose this realtime API surface.
+  Sarvam Python SDK (`sarvamai` 0.1.28) exposes no realtime client, so Pipecat's
+  built-in `SarvamSTTService` cannot reach this endpoint.
 - Automatic failover to another STT provider is not built in.
 - Runtime updates are limited to the initial public settings supported safely
   by the live protocol.
@@ -210,6 +246,19 @@ Both measurements use the same anchor in either endpointing mode. Under
 the adapter restores it after Pipecat's turn tracking re-anchors time to first
 byte to the end of the VAD segment, so manual and server endpointing report
 comparable numbers.
+
+Under `endpointing="vad"` the anchor is the moment Sarvam's `vad.speech_start`
+event is received, so these numbers measure the endpoint's transcription
+responsiveness and deliberately exclude Sarvam's own VAD warm-up — the server
+does not announce speech until `min_speech_duration_ms` has elapsed, after
+`prefix_padding_ms` of lead-in. Time to first transcript is therefore much
+smaller than the delay a speaker perceives, and is not comparable to a
+microphone-to-transcript measurement from another provider.
+
+Interruptions do not corrupt the measurement. Pipecat flushes all active
+metrics when an interruption is broadcast, so the adapter anchors the utterance
+before broadcasting and re-arms both timers if an interruption arrives from
+elsewhere in the pipeline mid-utterance.
 
 No stable benchmark numbers are claimed yet. The existing live test is a
 correctness check, not a statistically useful benchmark:
@@ -248,10 +297,10 @@ pytest
 ```
 
 Focused suites cover connection, final and interim transcription, VAD,
-manual endpointing, language resolution, connection recovery, interruption, and
-errors. The interruption matrix runs Pipecat's real `broadcast_interruption()`
-path against a simulated bot-audio sink and verifies final transcription for
-`नहीं`, `हाँ`, `रुकिए`, and `एक मिनट`.
+manual endpointing, language resolution, connection recovery, utterance latency
+metrics, interruption, and errors. The interruption matrix runs Pipecat's real
+`broadcast_interruption()` path against a simulated bot-audio sink and verifies
+final transcription for `नहीं`, `हाँ`, `रुकिए`, and `एक मिनट`.
 
 ## Browser harness
 

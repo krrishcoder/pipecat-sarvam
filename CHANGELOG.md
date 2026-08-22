@@ -21,9 +21,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   pipeline and displays the frames it emits, served over one port with no
   dependency beyond `websockets`.
 - `resolve_sarvam_language_code` is now exported from the package root.
+- `SUPPORTED_LANGUAGE_CODES` is now exported from the package root, and the
+  browser harness validates against it instead of mirroring the list.
+- README section comparing this package with Pipecat's built-in
+  `SarvamSTTService`, which targets a different Sarvam endpoint.
 
 ### Fixed
 
+- Report real utterance latency when interruptions are enabled. Pipecat flushes
+  all active metrics on an interruption broadcast, so time to first transcript
+  and final-transcript latency were reported as a few milliseconds of internal
+  overhead instead of the real values. The utterance is now anchored before the
+  broadcast, and the timers are re-armed if an interruption arrives from
+  elsewhere in the pipeline mid-utterance.
 - Cancel the previous keepalive task before reconnecting. `WebsocketSTTService`
   overwrites the handle unconditionally, so a stale task outlived its socket.
 - Latch termination after a fatal error. `WebsocketService._connect` resets
@@ -39,3 +49,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Accept the Sarvam language codes that have no Pipecat `Language` member, so
   every advertised code stays reachable.
 - Spawn only one deferred settings reconnect when finals arrive back to back.
+- Accept Sarvam's other Odia spelling. This realtime endpoint requires `or-IN` and
+  rejects `od-IN`, but Sarvam's batch, SDK-streaming, translation, and
+  text-to-speech APIs use `od-IN`, so `od-IN` is now normalized instead of
+  rejected. A transcript tagged either way maps back to `Language.OR_IN`.

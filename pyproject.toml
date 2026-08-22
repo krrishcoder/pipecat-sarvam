@@ -43,6 +43,10 @@ packages = ["src/pipecat_sarvam"]
 addopts = "-ra"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# tests/ imports the diagnostic client from examples/, which is not an installed
+# package. Put the repository root on sys.path so `examples.raw_realtime_stt`
+# resolves as a namespace package during collection.
+pythonpath = ["."]
 markers = [
   "integration: opt-in tests that call the live Sarvam API",
 ]

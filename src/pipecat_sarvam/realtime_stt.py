@@ -6,6 +6,7 @@ import asyncio
 import base64
 import copy
 import json
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -157,6 +158,34 @@ def sarvam_language_to_pipecat(language_code: str | None) -> Language | None:
         return None
 
 
+def resolve_sarvam_language_code(language: Language | str) -> str:
+    """Resolve a Pipecat ``Language`` or a raw code string to a Sarvam code.
+
+    Sarvam accepts several codes that have no Pipecat ``Language`` member, such
+    as ``ne-IN`` and ``sat-IN``. Those are passed through when supplied as plain
+    strings instead of raising, so every advertised code stays reachable.
+
+    Args:
+        language: A Pipecat ``Language`` member or a Sarvam language code.
+
+    Returns:
+        The Sarvam realtime language code.
+
+    Raises:
+        ValueError: If the value maps to no supported Sarvam code.
+    """
+    if isinstance(language, Language):
+        return language_to_sarvam_realtime_language(language)
+    if language in SUPPORTED_LANGUAGE_CODES:
+        return language
+    try:
+        return language_to_sarvam_realtime_language(Language(language))
+    except ValueError as error:
+        raise ValueError(
+            f"Unsupported Sarvam realtime language: {language!r}"
+        ) from error
+
+
 @dataclass
 class SarvamRealtimeSTTSettings(STTSettings):
     """Runtime and connection settings for Sarvam realtime STT."""
@@ -239,10 +268,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
                 and settings.language is not None
                 and not has_language_code
             ):
-                language = settings.language
-                if isinstance(language, str) and not isinstance(language, Language):
-                    language = Language(language)
-                default_settings.language_code = language_to_sarvam_realtime_language(language)
+                default_settings.language_code = resolve_sarvam_language_code(settings.language)
 
         self._validate_settings(default_settings)
         resolved_sample_rate = assert_given(default_settings.sample_rate)
@@ -266,6 +292,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         self._session_ready_timeout = session_ready_timeout
 
         self._receive_task: asyncio.Task | None = None
+        self._settings_reconnect_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
         self._connect_complete = asyncio.Event()
@@ -276,6 +303,12 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         self._session_end_data: dict[str, Any] | None = None
         self._ttft_pending = False
         self._consecutive_malformed_messages = 0
+        # Set by _terminate_connection. WebsocketService._connect() resets
+        # _disconnecting, so a separate latch is required to keep a fatal error
+        # from silently rebuilding the connection on the next audio frame.
+        self._terminated = False
+        self._utterance_start_time = 0.0
+        self._replaying_audio_buffer = False
 
     @staticmethod
     def _validate_settings(settings: Settings) -> None:
@@ -335,6 +368,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
     async def start(self, frame: StartFrame):
         """Connect when the Pipecat pipeline starts."""
         await super().start(frame)
+        self._terminated = False
         await self._connect()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -348,14 +382,30 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             await self._send_json({"event": "speech_start"})
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             self._user_speaking = False
+            # STTService._handle_vad_user_stopped_speaking has already re-anchored
+            # TTFB to the VAD speech end. Restore the Sarvam anchor so both
+            # endpointing modes report the same speech-start-to-first-transcript
+            # measurement documented in the README.
+            if self._utterance_start_time:
+                await self.start_ttfb_metrics(start_time=self._utterance_start_time)
             await self._send_json({"event": "speech_end"})
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         """Encode and stream audio; receive-task callbacks emit transcripts."""
+        if self._terminated:
+            # A fatal ErrorFrame was already pushed upstream. Recovery is over;
+            # the pipeline owns provider failover from here.
+            yield None
+            return
+
         await self._connect_complete.wait()
 
         if not self._websocket or self._websocket.state is not State.OPEN:
             await self._connect()
+
+        if self._terminated:
+            yield None
+            return
 
         await self._ensure_session_ready()
 
@@ -404,9 +454,15 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         async with self._connect_lock:
             if self._websocket and self._websocket.state is State.OPEN:
                 return
+            if self._terminated:
+                return
 
             self._connect_complete.clear()
             try:
+                # WebsocketSTTService._connect() calls _create_keepalive_task()
+                # unconditionally and overwrites the handle. Cancel any previous
+                # task first so a stale one cannot outlive its connection.
+                await self._cancel_keepalive_task()
                 await super()._connect()
                 attempts = self._max_reconnect_attempts if self._reconnect_on_error else 1
                 for attempt in range(1, attempts + 1):
@@ -459,6 +515,10 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
+
+        if self._settings_reconnect_task:
+            await self.cancel_task(self._settings_reconnect_task)
+            self._settings_reconnect_task = None
 
         await self._disconnect_websocket()
 
@@ -519,6 +579,7 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
 
         logger.error(f"{self} {message}")
         self._disconnecting = True
+        self._terminated = True
         self._session_ready.clear()
         self._session_ended.set()
         self._ttft_pending = False
@@ -564,6 +625,9 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
             ):
                 return True
 
+            # Mirror STTService._reconnect: buffer arriving audio for the whole
+            # recovery window, then replay it so the utterance is not truncated.
+            self._reconnect_audio_buffer.clear()
             self._reconnecting = True
             try:
                 await self._do_reconnect()
@@ -572,13 +636,34 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
                     timeout=self._session_ready_timeout,
                 )
                 logger.info(f"{self} recovered connection after {reason}")
-                return True
             except Exception as error:
                 message = f"Unable to recover Sarvam realtime connection after {reason}: {error}"
                 await self._terminate_connection(message, exception=error)
                 return False
             finally:
                 self._reconnecting = False
+
+        await self._replay_buffered_audio()
+        return True
+
+    async def _replay_buffered_audio(self):
+        """Replay audio buffered while the connection was down.
+
+        Guarded against re-entry because replaying goes back through
+        ``run_stt``, which can itself trigger another recovery cycle.
+        """
+        if self._replaying_audio_buffer:
+            return
+
+        self._replaying_audio_buffer = True
+        try:
+            while self._reconnect_audio_buffer:
+                buffered = list(self._reconnect_audio_buffer)
+                self._reconnect_audio_buffer.clear()
+                for buffered_frame, buffered_direction in buffered:
+                    await self.process_audio_frame(buffered_frame, buffered_direction)
+        finally:
+            self._replaying_audio_buffer = False
 
     async def _try_reconnect(
         self,
@@ -744,7 +829,10 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         self._user_speaking = True
         self._can_reconnect = False
         self._ttft_pending = True
-        await self.start_ttfb_metrics()
+        # Recorded on the same wall clock the metrics collector uses so the
+        # anchor can be restored if the base class re-anchors TTFB later.
+        self._utterance_start_time = time.time()
+        await self.start_ttfb_metrics(start_time=self._utterance_start_time)
         await self.start_processing_metrics()
 
     async def _mark_first_transcript_received(self):
@@ -760,8 +848,16 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         await self.stop_processing_metrics()
         self._user_speaking = False
         self._can_reconnect = True
-        if self._need_reconnect:
-            self.create_task(self._reconnect(), name="sarvam-realtime-settings-reconnect")
+        self._utterance_start_time = 0.0
+        # _need_reconnect is only cleared once _reconnect() actually runs, so
+        # two finals in quick succession would otherwise spawn overlapping
+        # reconnect tasks.
+        if self._need_reconnect and (
+            self._settings_reconnect_task is None or self._settings_reconnect_task.done()
+        ):
+            self._settings_reconnect_task = self.create_task(
+                self._reconnect(), name="sarvam-realtime-settings-reconnect"
+            )
 
     def _language_for_message(self, message: dict[str, Any]) -> Language | None:
         language_code = message.get("language")
@@ -839,17 +935,21 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
 
         candidate = copy.deepcopy(self._settings)
         candidate.apply_update(delta)
-        if is_given(delta.language) and delta.language is not None:
-            language = delta.language
-            if isinstance(language, str) and not isinstance(language, Language):
-                language = Language(language)
-            candidate.language_code = language_to_sarvam_realtime_language(language)
+        # Match __init__: an explicitly supplied language_code wins over the
+        # generic language field rather than the other way around.
+        derive_language_code = (
+            is_given(delta.language)
+            and delta.language is not None
+            and not is_given(getattr(delta, "language_code", NOT_GIVEN))
+        )
+        if derive_language_code:
+            candidate.language_code = resolve_sarvam_language_code(delta.language)
         self._validate_settings(candidate)
 
         changed = await super()._update_settings(delta)
-        if "language" in changed and self._settings.language is not None:
+        if derive_language_code and "language" in changed and self._settings.language is not None:
             previous_language_code = self._settings.language_code
-            self._settings.language_code = str(self._settings.language)
+            self._settings.language_code = resolve_sarvam_language_code(self._settings.language)
             changed.setdefault("language_code", previous_language_code)
 
         if not changed:

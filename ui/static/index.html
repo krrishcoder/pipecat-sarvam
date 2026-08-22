@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sarvam realtime · Pipecat frame trace</title>
+<style>
+  :root {
+    color-scheme: dark;
+
+    --ground: #17162B;
+    --panel: #201F38;
+    --panel-2: #272544;
+    --rule: #35335A;
+    --text: #E6E3F2;
+    --muted: #8B87AE;
+    --dim: #625E85;
+
+    --amber: #F0B429;   /* provisional — partial transcripts */
+    --cyan: #4CC9E0;    /* the speaking window */
+    --rose: #FF6B81;    /* errors */
+
+    --display: Futura, "Avenir Next Condensed", "Helvetica Neue", sans-serif;
+    --body: "Kohinoor Devanagari", "Devanagari Sangam MN", "Noto Sans Devanagari",
+            -apple-system, system-ui, sans-serif;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { height: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--text);
+    font-family: var(--body);
+    font-size: 15px;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Futura's caps at wide tracking read like instrument-panel silkscreen. */
+  .silk {
+    font-family: var(--display);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  /* ---------- header rail ---------- */
+
+  .rail {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 0 20px;
+    height: 52px;
+    flex: none;
+    border-bottom: 1px solid var(--rule);
+    background: var(--panel);
+  }
+
+  .mark {
+    font-family: var(--display);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--text);
+  }
+  .mark b { color: var(--cyan); font-weight: 500; }
+
+  .rail-spacer { flex: 1; }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .status .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--dim);
+    flex: none;
+  }
+  .status[data-state="connecting"] .dot { background: var(--amber); }
+  .status[data-state="listening"] .dot {
+    background: var(--cyan);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--cyan) 22%, transparent);
+  }
+  .status[data-state="error"] .dot { background: var(--rose); }
+
+  /* ---------- setup strip ---------- */
+
+  .setup {
+    display: flex;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 18px;
+    padding: 14px 20px;
+    flex: none;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field select {
+    appearance: none;
+    background: var(--panel-2);
+    border: 1px solid var(--rule);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 7px 26px 7px 9px;
+    background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+                      linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+    background-position: calc(100% - 14px) 51%, calc(100% - 9px) 51%;
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+  }
+  .field select:disabled { opacity: 0.45; }
+
+  .setup-spacer { flex: 1; }
+
+  button {
+    font-family: var(--display);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    padding: 9px 18px;
+    border: 1px solid var(--rule);
+    background: var(--panel-2);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  .primary { background: var(--cyan); border-color: var(--cyan); color: #10202B; }
+  .primary:hover:not(:disabled) { background: #6FD8EA; border-color: #6FD8EA; }
+  .primary[data-live="1"] { background: var(--rose); border-color: var(--rose); color: #2B1016; }
+  .primary[data-live="1"]:hover:not(:disabled) { background: #FF8494; border-color: #FF8494; }
+
+  .talk[data-held="1"] { background: var(--cyan); border-color: var(--cyan); color: #10202B; }
+  .talk[hidden] { display: none; }
+
+  :focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  /* ---------- the trace ---------- */
+
+  .trace { flex: none; padding: 18px 20px 0; }
+
+  .trace-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+  .trace-note {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+  }
+
+  #scope {
+    display: block;
+    width: 100%;
+    height: 172px;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+  }
+
+  .readings {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    margin-top: -1px;
+    border: 1px solid var(--rule);
+    background: var(--panel);
+  }
+  .reading {
+    padding: 9px 16px;
+    border-right: 1px solid var(--rule);
+    min-width: 128px;
+  }
+  .reading:last-child { border-right: none; }
+  .reading .v {
+    font-family: var(--mono);
+    font-size: 16px;
+    color: var(--text);
+    display: block;
+    margin-top: 1px;
+  }
+  .reading .v.pending { color: var(--dim); }
+  .reading .v em { font-style: normal; font-size: 11px; color: var(--dim); }
+
+  /* ---------- panes ---------- */
+
+  .split {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 18px;
+    padding: 18px 20px 20px;
+  }
+
+  .pane {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border: 1px solid var(--rule);
+    background: var(--panel);
+  }
+  .pane-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 11px 14px;
+    flex: none;
+    border-bottom: 1px solid var(--rule);
+  }
+  .pane-head .silk { flex: 1; }
+  .pane-head button { padding: 5px 10px; font-size: 10px; }
+
+  .pane-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px;
+  }
+
+  .empty {
+    color: var(--dim);
+    font-size: 13px;
+    max-width: 42ch;
+  }
+
+  /* transcript */
+
+  .said {
+    font-family: var(--body);
+    font-size: 19px;
+    line-height: 1.45;
+    margin: 0 0 10px;
+    padding-left: 12px;
+    border-left: 2px solid var(--rule);
+  }
+  .said .meta {
+    display: block;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    margin-top: 3px;
+  }
+
+  /* Provisional text is amber and unruled; a commit turns it plain and
+     gives it a rule. The colour shift *is* the interim/final distinction. */
+  .live {
+    font-family: var(--body);
+    font-size: 19px;
+    line-height: 1.45;
+    color: var(--amber);
+    padding-left: 12px;
+    border-left: 2px dotted color-mix(in srgb, var(--amber) 55%, transparent);
+    min-height: 1.45em;
+  }
+  .live:empty { display: none; }
+
+  /* frame log */
+
+  .log { font-family: var(--mono); font-size: 11.5px; line-height: 1.75; }
+  .row { display: flex; gap: 9px; white-space: nowrap; }
+  .row .t { color: var(--dim); flex: none; }
+  .row .d { color: var(--dim); flex: none; width: 1ch; }
+  .row .n { flex: none; }
+  .row .x {
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .row[data-k="interim"] .n { color: var(--amber); }
+  .row[data-k="final"] .n { color: var(--text); }
+  .row[data-k="speech_start"] .n,
+  .row[data-k="speech_end"] .n { color: var(--cyan); }
+  .row[data-k="error"] .n,
+  .row[data-k="error"] .x { color: var(--rose); }
+  .row[data-k="metrics"] .n { color: #A78BFA; }
+  .row[data-k="other"] .n,
+  .row[data-k="start"] .n,
+  .row[data-k="stt_metadata"] .n { color: var(--muted); }
+
+  .banner {
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    border-left: 2px solid var(--rose);
+    background: color-mix(in srgb, var(--rose) 10%, transparent);
+    color: var(--rose);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .banner[hidden] { display: none; }
+
+  .footnote {
+    padding: 0 20px 18px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+    flex: none;
+  }
+
+  @media (max-width: 900px) {
+    .split { grid-template-columns: minmax(0, 1fr); }
+    body { height: auto; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+    .status .dot { box-shadow: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="rail">
+  <div class="mark">Sarvam <b>·</b> Realtime</div>
+  <div class="rail-spacer"></div>
+  <div class="status" id="status" data-state="idle">
+    <span class="dot"></span><span id="statusText">Not connected</span>
+  </div>
+</header>
+
+<section class="setup">
+  <label class="field">
+    <span class="silk">Language</span>
+    <select id="language"></select>
+  </label>
+  <label class="field">
+    <span class="silk">Mode</span>
+    <select id="mode">
+      <option value="transcribe" selected>transcribe</option>
+      <option value="translate">translate</option>
+      <option value="verbatim">verbatim</option>
+      <option value="translit">translit</option>
+      <option value="codemix">codemix</option>
+    </select>
+  </label>
+  <label class="field">
+    <span class="silk">Stream</span>
+    <select id="streamType">
+      <option value="fast" selected>fast</option>
+      <option value="balanced">balanced</option>
+      <option value="simulated">simulated</option>
+    </select>
+  </label>
+  <label class="field">
+    <span class="silk">Endpointing</span>
+    <select id="endpointing">
+      <option value="vad" selected>vad — Sarvam decides turns</option>
+      <option value="manual">manual — you mark turns</option>
+    </select>
+  </label>
+  <label class="field">
+    <span class="silk">Sample rate</span>
+    <select id="sampleRate">
+      <option value="16000" selected>16000</option>
+      <option value="8000">8000</option>
+    </select>
+  </label>
+  <div class="setup-spacer"></div>
+  <button class="talk" id="talk" hidden>Hold to talk</button>
+  <button class="primary" id="toggle">Start listening</button>
+</section>
+
+<section class="trace">
+  <div class="trace-head">
+    <span class="silk">Frame trace</span>
+    <span class="trace-note">last 12 seconds, newest at the right</span>
+  </div>
+  <canvas id="scope"></canvas>
+  <div class="readings">
+    <div class="reading">
+      <span class="silk">TTFB, pipeline</span>
+      <span class="v pending" id="rTtfb">—</span>
+    </div>
+    <div class="reading">
+      <span class="silk">TTFB median</span>
+      <span class="v pending" id="rTtfbMed">—</span>
+    </div>
+    <div class="reading">
+      <span class="silk">Speech → partial</span>
+      <span class="v pending" id="rObserved">—</span>
+    </div>
+    <div class="reading">
+      <span class="silk">Partials</span>
+      <span class="v pending" id="rPartials">0</span>
+    </div>
+    <div class="reading">
+      <span class="silk">Commits</span>
+      <span class="v pending" id="rFinals">0</span>
+    </div>
+    <div class="reading">
+      <span class="silk">Audio sent</span>
+      <span class="v pending" id="rAudio">0.0<em>s</em></span>
+    </div>
+  </div>
+</section>
+
+<div class="split">
+  <section class="pane">
+    <div class="pane-head">
+      <span class="silk">Transcript</span>
+      <button id="clearTranscript">Clear</button>
+    </div>
+    <div class="pane-body" id="transcriptBody">
+      <p class="empty" id="transcriptEmpty">
+        Nothing yet. Start listening and speak. Provisional text appears in amber
+        and is replaced as Sarvam revises it; each committed turn moves up as plain text.
+      </p>
+      <div id="finals"></div>
+      <div class="live" id="live"></div>
+    </div>
+  </section>
+
+  <section class="pane">
+    <div class="pane-head">
+      <span class="silk">Pipecat frames</span>
+      <button id="copyLog">Copy as JSONL</button>
+      <button id="clearLog">Clear</button>
+    </div>
+    <div class="pane-body" id="logBody">
+      <p class="banner" id="banner" hidden></p>
+      <p class="empty" id="logEmpty">
+        Every frame the pipeline pushes shows up here, newest first, with the
+        direction it travelled. This is the adapter's real output, not a replay
+        of the Sarvam protocol.
+      </p>
+      <div class="log" id="log"></div>
+    </div>
+  </section>
+</div>
+
+<p class="footnote">
+  Codes marked † have no Pipecat <code>Language</code> member and reach Sarvam only
+  through <code>language_code</code>.
+</p>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ config */
+
+// † marks codes with no Pipecat Language member.
+const LANGUAGES = [
+  ["hi-IN", "Hindi"], ["en-IN", "English"], ["auto", "Auto-detect"],
+  ["as-IN", "Assamese"], ["bn-IN", "Bengali"], ["brx-IN", "Bodo †"],
+  ["doi-IN", "Dogri †"], ["gu-IN", "Gujarati"], ["kn-IN", "Kannada"],
+  ["kok-IN", "Konkani"], ["ks-IN", "Kashmiri †"], ["mai-IN", "Maithili"],
+  ["ml-IN", "Malayalam"], ["mni-IN", "Manipuri †"], ["mr-IN", "Marathi"],
+  ["ne-IN", "Nepali †"], ["or-IN", "Odia"], ["pa-IN", "Punjabi"],
+  ["sa-IN", "Sanskrit †"], ["sat-IN", "Santali †"], ["sd-IN", "Sindhi"],
+  ["ta-IN", "Tamil"], ["te-IN", "Telugu"], ["ur-IN", "Urdu"],
+];
+
+const WINDOW_MS = 12000;
+const GUTTER = 78;
+const LANES = [
+  { key: "mic",     label: "Mic",      h: 42 },
+  { key: "vad",     label: "Speaking", h: 16 },
+  { key: "partial", label: "Partial",  h: 18 },
+  { key: "final",   label: "Commit",   h: 18 },
+];
+const LANE_GAP = 12;
+const TOP_PAD = 30;   // room for the caliper label
+const BOTTOM_PAD = 16;
+
+const $ = (id) => document.getElementById(id);
+
+/* -------------------------------------------------------------------- state */
+
+const state = {
+  ws: null,
+  ctx: null,
+  node: null,
+  sink: null,
+  stream: null,
+  live: false,
+  ready: false,
+  sampleRate: 16000,
+  endpointing: "vad",
+
+  amps: [],          // { t, v }
+  spans: [],         // { start, end }
+  partials: [],      // { t }
+  commits: [],       // { t }
+  caliper: null,     // { start, end, ms }
+  awaitingFirst: 0,  // timestamp of the open speech_start, 0 if satisfied
+
+  ttfbs: [],
+  partialCount: 0,
+  commitCount: 0,
+  samplesSent: 0,
+  logLines: [],
+};
+
+/* ---------------------------------------------------------------- UI helpers */
+
+function setStatus(kind, text) {
+  $("status").dataset.state = kind;
+  $("statusText").textContent = text;
+}
+
+function reading(id, text, pending) {
+  const el = $(id);
+  el.innerHTML = text;
+  el.classList.toggle("pending", Boolean(pending));
+}
+
+function ms(seconds) {
+  return `${Math.round(seconds * 1000)}<em>ms</em>`;
+}
+
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function refreshReadings() {
+  if (state.ttfbs.length) {
+    reading("rTtfb", ms(state.ttfbs[state.ttfbs.length - 1]), false);
+    reading("rTtfbMed", ms(median(state.ttfbs)), false);
+  }
+  if (state.caliper) {
+    reading("rObserved", `${state.caliper.ms}<em>ms</em>`, false);
+  }
+  reading("rPartials", String(state.partialCount), state.partialCount === 0);
+  reading("rFinals", String(state.commitCount), state.commitCount === 0);
+  const secs = state.samplesSent / state.sampleRate;
+  reading("rAudio", `${secs.toFixed(1)}<em>s</em>`, secs === 0);
+}
+
+function showBanner(text) {
+  const el = $("banner");
+  el.textContent = text;
+  el.hidden = !text;
+}
+
+function clockLabel(date) {
+  return date.toTimeString().slice(0, 8) + "." +
+    String(date.getMilliseconds()).padStart(3, "0");
+}
+
+function addRow(payload) {
+  $("logEmpty").hidden = true;
+  const now = new Date();
+  state.logLines.push(JSON.stringify({ at: now.toISOString(), ...payload }));
+
+  const row = document.createElement("div");
+  row.className = "row";
+  row.dataset.k = payload.type;
+
+  const arrow = payload.direction === "UPSTREAM" ? "↑" : "↓";
+  row.innerHTML =
+    `<span class="t">${clockLabel(now)}</span>` +
+    `<span class="d">${arrow}</span>` +
+    `<span class="n">${escapeHtml(payload.frame || payload.kind)}</span>` +
+    `<span class="x">${escapeHtml(detailOf(payload))}</span>`;
+
+  const log = $("log");
+  log.prepend(row);
+  while (log.childElementCount > 400) {
+    log.lastElementChild.remove();
+  }
+}
+
+function escapeHtml(text) {
+  return String(text == null ? "" : text).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function metricValue(d) {
+  // Most metrics carry a numeric `value`, but STTUsageMetricsData wraps an
+  // object and TTFAMetricsData/TurnMetricsData have no `value` at all.
+  if (typeof d.value === "number") return d.value.toFixed(4).replace(/0+$/, "");
+  if (d.value && typeof d.value === "object") {
+    return Object.entries(d.value)
+      .filter(([, v]) => v)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(",") || "0";
+  }
+  const rest = Object.entries(d)
+    .filter(([k]) => !["type", "processor", "model", "value"].includes(k))
+    .map(([k, v]) => `${k}=${v}`);
+  return rest.join(" ") || "—";
+}
+
+function detailOf(p) {
+  switch (p.type) {
+    case "interim":
+    case "final":
+      return `${p.language || "?"}  ${p.text}`;
+    case "error":
+      return `${p.fatal ? "fatal " : ""}${p.error}`;
+    case "metrics":
+      return (p.data || [])
+        .map((d) => `${d.type.replace("MetricsData", "")}=${metricValue(d)}`)
+        .join("  ");
+    case "start":
+      return `${p.audio_in_sample_rate} Hz  metrics=${p.enable_metrics}`;
+    case "stt_metadata":
+      return `${p.service_name}  turns=${p.user_turn_strategies || "none"}`;
+    default:
+      return "";
+  }
+}
+
+/* ------------------------------------------------------------- frame routing */
+
+function onFrame(p) {
+  const now = performance.now();
+  addRow(p);
+
+  if (p.type === "speech_start") {
+    state.spans.push({ start: now, end: null });
+    state.awaitingFirst = now;
+  } else if (p.type === "speech_end") {
+    for (let i = state.spans.length - 1; i >= 0; i--) {
+      if (state.spans[i].end === null) { state.spans[i].end = now; break; }
+    }
+    state.awaitingFirst = 0;
+  } else if (p.type === "interim") {
+    state.partials.push({ t: now });
+    state.partialCount += 1;
+    if (state.awaitingFirst && p.text) {
+      state.caliper = {
+        start: state.awaitingFirst,
+        end: now,
+        ms: Math.round(now - state.awaitingFirst),
+      };
+      state.awaitingFirst = 0;
+    }
+    $("transcriptEmpty").hidden = true;
+    $("live").textContent = p.text;
+  } else if (p.type === "final") {
+    state.commits.push({ t: now });
+    state.commitCount += 1;
+    $("live").textContent = "";
+    if (p.text) {
+      $("transcriptEmpty").hidden = true;
+      const line = document.createElement("p");
+      line.className = "said";
+      line.innerHTML = `${escapeHtml(p.text)}<span class="meta">` +
+        `${escapeHtml(p.language || "?")} · finalized=${p.finalized}</span>`;
+      $("finals").append(line);
+      const body = $("transcriptBody");
+      body.scrollTop = body.scrollHeight;
+    }
+  } else if (p.type === "metrics") {
+    for (const d of p.data || []) {
+      if (d.type === "TTFBMetricsData" && d.value > 0) state.ttfbs.push(d.value);
+    }
+  } else if (p.type === "error") {
+    showBanner(`${p.fatal ? "Fatal: " : ""}${p.error}`);
+    if (p.fatal) setStatus("error", "Pipeline stopped");
+  }
+
+  refreshReadings();
+}
+
+/* ------------------------------------------------------------------- capture */
+
+async function startCapture() {
+  const rate = Number($("sampleRate").value);
+  state.sampleRate = rate;
+
+  state.stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+  });
+
+  // Chrome honours sampleRate here; Safari may not, so the worklet resamples.
+  state.ctx = new AudioContext({ sampleRate: rate, latencyHint: "interactive" });
+  await state.ctx.audioWorklet.addModule("pcm-worklet.js");
+
+  const source = state.ctx.createMediaStreamSource(state.stream);
+  state.node = new AudioWorkletNode(state.ctx, "pcm-capture", {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    processorOptions: { targetSampleRate: rate, blockSize: 512 },
+  });
+  state.node.port.onmessage = (event) => onPcm(new Int16Array(event.data));
+
+  // A worklet node that reaches nothing is not reliably pulled by the
+  // rendering graph, so the output is routed to the destination through a
+  // muted gain node. The processor writes nothing, and gain 0 guarantees
+  // silence even if that ever changes.
+  state.sink = state.ctx.createGain();
+  state.sink.gain.value = 0;
+  source.connect(state.node);
+  state.node.connect(state.sink);
+  state.sink.connect(state.ctx.destination);
+}
+
+function onPcm(pcm) {
+  const now = performance.now();
+
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+  const rms = Math.sqrt(sum / pcm.length) / 32768;
+  state.amps.push({ t: now, v: Math.min(1, Math.sqrt(rms) * 1.9) });
+
+  const ws = state.ws;
+  if (!state.ready || !ws || ws.readyState !== WebSocket.OPEN) return;
+  // Drop rather than queue without bound: a backlog would make every latency
+  // reading meaningless.
+  if (ws.bufferedAmount > 1 << 20) return;
+  ws.send(pcm.buffer);
+  state.samplesSent += pcm.length;
+}
+
+async function stopCapture() {
+  if (state.node) { state.node.port.onmessage = null; state.node.disconnect(); }
+  if (state.sink) state.sink.disconnect();
+  if (state.stream) state.stream.getTracks().forEach((t) => t.stop());
+  if (state.ctx) await state.ctx.close().catch(() => {});
+  state.node = state.stream = state.ctx = state.sink = null;
+}
+
+/* ----------------------------------------------------------------- transport */
+
+function connect() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${scheme}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  state.ws = ws;
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      type: "start",
+      language_code: $("language").value,
+      mode: $("mode").value,
+      stream_type: $("streamType").value,
+      endpointing: $("endpointing").value,
+      sample_rate: Number($("sampleRate").value),
+    }));
+  };
+
+  ws.onmessage = (event) => {
+    const payload = JSON.parse(event.data);
+    if (payload.kind) { onFrame(payload); return; }
+
+    if (payload.type === "ready") {
+      state.ready = true;
+      setStatus("listening", `Listening · ${payload.settings.language_code} · ` +
+        `${payload.settings.mode} · ${payload.settings.sample_rate} Hz`);
+    } else if (payload.type === "fatal") {
+      showBanner(payload.error);
+      setStatus("error", "Rejected");
+      stop();
+    } else if (payload.type === "config_error") {
+      showBanner(`Config rejected: ${payload.error}`);
+    }
+  };
+
+  ws.onerror = () => setStatus("error", "Connection failed");
+  ws.onclose = () => { if (state.live) stop(); };
+}
+
+/* ------------------------------------------------------------------ controls */
+
+// Readings are per-session; carrying a previous run's latencies over would
+// quietly mix two different configurations into one median.
+function resetSession() {
+  state.amps = [];
+  state.spans = [];
+  state.partials = [];
+  state.commits = [];
+  state.caliper = null;
+  state.awaitingFirst = 0;
+  state.ttfbs = [];
+  state.partialCount = 0;
+  state.commitCount = 0;
+  state.samplesSent = 0;
+  for (const id of ["rTtfb", "rTtfbMed", "rObserved"]) reading(id, "—", true);
+  refreshReadings();
+  needsRepaint = true;
+}
+
+async function start() {
+  showBanner("");
+  resetSession();
+  setStatus("connecting", "Opening microphone");
+  try {
+    await startCapture();
+  } catch (error) {
+    setStatus("error", "Microphone unavailable");
+    showBanner(`Cannot capture audio: ${error.message}. Grant microphone ` +
+      `access for this origin, then start again.`);
+    await stopCapture();
+    return;
+  }
+
+  state.live = true;
+  state.endpointing = $("endpointing").value;
+  setStatus("connecting", "Connecting to the pipeline");
+  connect();
+
+  $("toggle").textContent = "Stop";
+  $("toggle").dataset.live = "1";
+  $("talk").hidden = state.endpointing !== "manual";
+  setControlsDisabled(true);
+}
+
+async function stop() {
+  state.live = false;
+  state.ready = false;
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "stop" }));
+    state.ws.close();
+  }
+  state.ws = null;
+  await stopCapture();
+
+  $("live").textContent = "";
+  $("toggle").textContent = "Start listening";
+  delete $("toggle").dataset.live;
+  $("talk").hidden = true;
+  delete $("talk").dataset.held;
+  setControlsDisabled(false);
+  if ($("status").dataset.state !== "error") setStatus("idle", "Not connected");
+}
+
+function setControlsDisabled(disabled) {
+  for (const id of ["language", "mode", "streamType", "endpointing", "sampleRate"]) {
+    $(id).disabled = disabled;
+  }
+}
+
+function sendVad(speaking) {
+  if (state.ws && state.ready) {
+    state.ws.send(JSON.stringify({ type: "vad", speaking }));
+  }
+}
+
+function holdTalk(held) {
+  if (!state.live || state.endpointing !== "manual") return;
+  const button = $("talk");
+  if (held && button.dataset.held) return;
+  if (!held && !button.dataset.held) return;
+  if (held) button.dataset.held = "1"; else delete button.dataset.held;
+  sendVad(held);
+}
+
+/* --------------------------------------------------------------------- scope */
+
+function pruneWindow(now) {
+  const cutoff = now - WINDOW_MS;
+  const trim = (list) => { while (list.length && list[0].t < cutoff) list.shift(); };
+  trim(state.amps);
+  trim(state.partials);
+  trim(state.commits);
+  while (state.spans.length && state.spans[0].end !== null &&
+         state.spans[0].end < cutoff) {
+    state.spans.shift();
+  }
+  if (state.caliper && state.caliper.end < cutoff) state.caliper = null;
+}
+
+const scope = $("scope");
+const g = scope.getContext("2d");
+
+function sizeScope() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = scope.getBoundingClientRect();
+  scope.width = Math.max(1, Math.round(rect.width * dpr));
+  scope.height = Math.max(1, Math.round(rect.height * dpr));
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  needsRepaint = true;
+}
+
+function laneBands(height) {
+  const total = LANES.reduce((sum, l) => sum + l.h, 0) + LANE_GAP * (LANES.length - 1);
+  let y = TOP_PAD + Math.max(0, (height - TOP_PAD - BOTTOM_PAD - total) / 2);
+  const bands = {};
+  for (const lane of LANES) {
+    bands[lane.key] = { y, h: lane.h, mid: y + lane.h / 2, label: lane.label };
+    y += lane.h + LANE_GAP;
+  }
+  return bands;
+}
+
+function draw() {
+  const rect = scope.getBoundingClientRect();
+  const width = rect.width;
+  const height = rect.height;
+  const now = performance.now();
+  pruneWindow(now);
+
+  const plot = width - GUTTER - 10;
+  const x = (t) => GUTTER + (1 - (now - t) / WINDOW_MS) * plot;
+  const bands = laneBands(height);
+
+  g.clearRect(0, 0, width, height);
+
+  // time grid
+  g.strokeStyle = "rgba(255,255,255,0.045)";
+  g.lineWidth = 1;
+  // Canvas does not resolve CSS custom properties, so fonts are literal here.
+  g.font = '10px "SF Mono", ui-monospace, Menlo, monospace';
+  g.fillStyle = "#4A4670";
+  g.textAlign = "center";
+  for (let back = 0; back <= WINDOW_MS; back += 2000) {
+    const gx = Math.round(x(now - back)) + 0.5;
+    g.beginPath();
+    g.moveTo(gx, TOP_PAD - 8);
+    g.lineTo(gx, height - BOTTOM_PAD + 4);
+    g.stroke();
+    if (back % 4000 === 0 && back !== 0) {
+      g.fillText(`-${back / 1000}s`, gx, height - 4);
+    }
+  }
+
+  // lane labels + baselines
+  g.textAlign = "right";
+  for (const lane of LANES) {
+    const band = bands[lane.key];
+    g.fillStyle = "#625E85";
+    g.font = '500 9px Futura, "Avenir Next", sans-serif';
+    g.fillText(lane.label.toUpperCase(), GUTTER - 14, band.mid + 3);
+    g.strokeStyle = "rgba(255,255,255,0.06)";
+    g.beginPath();
+    g.moveTo(GUTTER, Math.round(band.mid) + 0.5);
+    g.lineTo(width - 10, Math.round(band.mid) + 0.5);
+    g.stroke();
+  }
+
+  // commit guides run the full height: a commit is the event that matters
+  const top = bands.mic.y - 6;
+  const bottom = bands.final.y + bands.final.h + 6;
+  g.setLineDash([2, 4]);
+  g.strokeStyle = "rgba(230,227,242,0.30)";
+  for (const c of state.commits) {
+    const cx = Math.round(x(c.t)) + 0.5;
+    g.beginPath();
+    g.moveTo(cx, top);
+    g.lineTo(cx, bottom);
+    g.stroke();
+  }
+  g.setLineDash([]);
+
+  // mic amplitude
+  const mic = bands.mic;
+  g.fillStyle = "#5B5788";
+  for (const a of state.amps) {
+    const h = Math.max(1, a.v * (mic.h / 2));
+    g.fillRect(Math.round(x(a.t)), mic.mid - h, 1.6, h * 2);
+  }
+
+  // speaking window
+  const vad = bands.vad;
+  g.fillStyle = "rgba(76,201,224,0.20)";
+  g.strokeStyle = "#4CC9E0";
+  for (const span of state.spans) {
+    const x0 = x(span.start);
+    const x1 = span.end === null ? x(now) : x(span.end);
+    const w = Math.max(2, x1 - x0);
+    g.fillRect(x0, vad.y, w, vad.h);
+    g.beginPath();
+    g.moveTo(x0 + 0.5, vad.y);
+    g.lineTo(x0 + 0.5, vad.y + vad.h);
+    g.stroke();
+  }
+
+  // partial ticks
+  const par = bands.partial;
+  g.fillStyle = "#F0B429";
+  for (const p of state.partials) {
+    g.fillRect(Math.round(x(p.t)), par.y + 2, 1.6, par.h - 4);
+  }
+
+  // commits
+  const fin = bands.final;
+  g.fillStyle = "#E6E3F2";
+  for (const c of state.commits) {
+    g.beginPath();
+    g.arc(x(c.t), fin.mid, 4, 0, Math.PI * 2);
+    g.fill();
+  }
+
+  drawCaliper(x, bands);
+}
+
+/* The signature reading: a bracket spanning speech-start to the first partial,
+   which is exactly the "time to first transcript" the README benchmarks. */
+function drawCaliper(x, bands) {
+  const cal = state.caliper;
+  if (!cal) return;
+
+  const x0 = x(cal.start);
+  const x1 = x(cal.end);
+  if (x1 - x0 < 1) return;
+
+  const y = bands.vad.y - 13;
+  g.strokeStyle = "#F0B429";
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(x0 + 0.5, y - 4);
+  g.lineTo(x0 + 0.5, y + 4);
+  g.moveTo(x0, y + 0.5);
+  g.lineTo(x1, y + 0.5);
+  g.moveTo(x1 - 0.5, y - 4);
+  g.lineTo(x1 - 0.5, y + 4);
+  g.stroke();
+
+  g.fillStyle = "#F0B429";
+  g.font = '11px "SF Mono", ui-monospace, monospace';
+  g.textAlign = "left";
+  g.fillText(`${cal.ms} ms to first partial`, Math.max(GUTTER, x0), y - 8);
+}
+
+let needsRepaint = true;
+
+function frame() {
+  // Idle means nothing is scrolling, so skip the repaint entirely rather than
+  // burning a frame budget on an empty grid.
+  const busy = state.live || state.amps.length || state.spans.length ||
+    state.partials.length || state.commits.length;
+  if (busy || needsRepaint) {
+    needsRepaint = false;
+    draw();
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------------------------------------------------------------------- init */
+
+for (const [code, name] of LANGUAGES) {
+  const option = document.createElement("option");
+  option.value = code;
+  option.textContent = `${code} — ${name}`;
+  if (code === "hi-IN") option.selected = true;
+  $("language").append(option);
+}
+
+$("toggle").addEventListener("click", () => (state.live ? stop() : start()));
+$("endpointing").addEventListener("change", (event) => {
+  state.endpointing = event.target.value;
+});
+
+$("talk").addEventListener("pointerdown", () => holdTalk(true));
+$("talk").addEventListener("pointerup", () => holdTalk(false));
+$("talk").addEventListener("pointerleave", () => holdTalk(false));
+window.addEventListener("keydown", (event) => {
+  // Clicking "Hold to talk" leaves it focused, so accept the button too, but
+  // never steal Space from a select or a text field.
+  const tag = event.target.tagName;
+  if (tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA") return;
+  if (event.code === "Space" && !event.repeat) {
+    event.preventDefault();
+    holdTalk(true);
+  }
+});
+window.addEventListener("keyup", (event) => {
+  if (event.code === "Space") holdTalk(false);
+});
+
+$("clearTranscript").addEventListener("click", () => {
+  $("finals").replaceChildren();
+  $("live").textContent = "";
+  $("transcriptEmpty").hidden = false;
+});
+$("clearLog").addEventListener("click", () => {
+  $("log").replaceChildren();
+  state.logLines = [];
+  $("logEmpty").hidden = false;
+  showBanner("");
+});
+$("copyLog").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const text = state.logLines.join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    button.textContent = `Copied ${state.logLines.length} frames`;
+  } catch {
+    button.textContent = "Clipboard blocked";
+  }
+  setTimeout(() => { button.textContent = "Copy as JSONL"; }, 1600);
+});
+
+window.addEventListener("beforeunload", () => { if (state.live) stop(); });
+new ResizeObserver(sizeScope).observe(scope);
+sizeScope();
+refreshReadings();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

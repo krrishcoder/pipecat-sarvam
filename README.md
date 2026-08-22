@@ -205,6 +205,12 @@ Pipecat metrics report:
   partial, or to the final transcript when no partial arrives
 - Final transcript latency: Sarvam `vad.speech_start` to `transcript.final`
 
+Both measurements use the same anchor in either endpointing mode. Under
+`endpointing="manual"` the anchor is the local `VADUserStartedSpeakingFrame`;
+the adapter restores it after Pipecat's turn tracking re-anchors time to first
+byte to the end of the VAD segment, so manual and server endpointing report
+comparable numbers.
+
 No stable benchmark numbers are claimed yet. The existing live test is a
 correctness check, not a statistically useful benchmark:
 
@@ -242,9 +248,31 @@ pytest
 ```
 
 Focused suites cover connection, final and interim transcription, VAD,
-interruption, and errors. The interruption matrix runs Pipecat's real
-`broadcast_interruption()` path against a simulated bot-audio sink and verifies
-final transcription for `नहीं`, `हाँ`, `रुकिए`, and `एक मिनट`.
+manual endpointing, language resolution, connection recovery, interruption, and
+errors. The interruption matrix runs Pipecat's real `broadcast_interruption()`
+path against a simulated bot-audio sink and verifies final transcription for
+`नहीं`, `हाँ`, `रुकिए`, and `एक मिनट`.
+
+## Browser harness
+
+`ui/` is a debugging harness, not part of the shipped package. It runs
+`SarvamRealtimeSTTService` inside a real `Pipeline` and displays the actual
+frames the service emits, so what you see is adapter output rather than a
+reimplementation of the protocol:
+
+```bash
+python ui/server.py
+```
+
+Then open <http://127.0.0.1:8080> and allow microphone access. The page streams
+mic audio as mono linear16 at the selected sample rate, plots speech windows
+against partial and commit events on a timeline, and reads back the pipeline's
+own time-to-first-byte alongside a browser-side speech-start-to-first-partial
+measurement.
+
+The API key is read server-side from `.env` and is never sent to the browser.
+The harness binds to loopback and has no authentication, so do not expose the
+port to a network.
 
 ## Attribution
 

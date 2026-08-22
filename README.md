@@ -52,8 +52,20 @@ low-latency barge-in.
 
 ## Installation
 
-Python 3.11 or newer is required. Until a package release is published, install
-directly from the repository:
+Python 3.11 or newer is required.
+
+```bash
+python -m pip install pipecat-sarvam
+```
+
+To run the bundled example you also need Pipecat's development runner and a
+WebRTC transport:
+
+```bash
+python -m pip install "pipecat-ai[runner,webrtc]"
+```
+
+To install the unreleased `main` branch instead:
 
 ```bash
 python -m pip install \
@@ -148,7 +160,35 @@ Runtime-supported settings can be updated without replacing the service:
 await stt.update_config(mode="codemix")
 ```
 
-See `examples/realtime_stt.py` for service construction.
+See `examples/realtime_stt_bot.py` for a complete pipeline you can run.
+
+## Runnable example
+
+`examples/realtime_stt_bot.py` is a full single-file Pipecat bot: browser
+microphone in, Sarvam transcription out. It prints each partial hypothesis as it
+arrives and then the finalized transcript, with the elapsed time since Sarvam
+detected speech, so the head start that partials give you is visible in the
+terminal.
+
+```bash
+python -m pip install pipecat-sarvam "pipecat-ai[runner,webrtc]"
+export SARVAM_API_KEY="your-api-key"
+python examples/realtime_stt_bot.py -t webrtc
+```
+
+Open the URL the runner prints and allow microphone access. Set
+`SARVAM_LANGUAGE_CODE` to transcribe a language other than Hindi.
+
+The pipeline is deliberately transcription-only, so it needs exactly one API
+key. Inserting a context aggregator, an LLM, and a TTS service between `stt` and
+`transport.output()` turns it into a voice agent, and barge-in then works
+without further configuration because the service broadcasts a Pipecat
+interruption as soon as Sarvam reports speech.
+
+No local VAD analyzer is configured. With `endpointing="vad"` Sarvam performs
+turn detection server-side and the service advertises
+`ExternalUserTurnStrategies`, so there is no Silero model to download and no
+`pipecat-ai[silero]` dependency.
 
 ## Supported languages
 

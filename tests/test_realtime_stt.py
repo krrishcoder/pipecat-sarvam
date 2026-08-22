@@ -2,6 +2,8 @@
 
 import base64
 import json
+import tomllib
+from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
@@ -42,8 +44,23 @@ class RecordingWebSocket:
 
 def test_package_exports_realtime_service() -> None:
     """The public package should expose its version and service class."""
-    assert pipecat_sarvam.__version__ == "0.1.0.dev0"
+    assert isinstance(pipecat_sarvam.__version__, str)
+    assert pipecat_sarvam.__version__
     assert pipecat_sarvam.SarvamRealtimeSTTService is SarvamRealtimeSTTService
+
+
+def test_version_matches_packaging_metadata() -> None:
+    """``__init__`` and ``pyproject.toml`` must agree, or a release ships a wrong version.
+
+    Asserting a literal here would mean bumping the version in three places, so this
+    checks the two that matter against each other instead.
+    """
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    if not pyproject.is_file():
+        pytest.skip("pyproject.toml is absent when running against an installed wheel")
+
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert pipecat_sarvam.__version__ == declared
 
 
 def test_default_url_targets_realtime_model() -> None:

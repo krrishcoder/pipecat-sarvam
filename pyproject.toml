@@ -4,20 +4,39 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pipecat-sarvam"
-version = "0.1.0.dev0"
-description = "Community-maintained Sarvam AI services for Pipecat"
+# Keep in sync with src/pipecat_sarvam/__init__.py; the two are asserted equal by
+# tests/test_realtime_stt.py::test_version_matches_packaging_metadata.
+version = "0.1.0"
+description = "Community-maintained Sarvam realtime speech-to-text service for Pipecat"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [
   { name = "pipecat-sarvam contributors" },
 ]
+keywords = [
+  "pipecat",
+  "sarvam",
+  "speech-to-text",
+  "stt",
+  "asr",
+  "realtime",
+  "voice-ai",
+  "indic",
+  "hindi",
+  "websocket",
+]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
   "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
   "pipecat-ai>=1.7.0",
@@ -33,11 +52,27 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/krrishcoder/pipecat-sarvam"
+Documentation = "https://github.com/krrishcoder/pipecat-sarvam#readme"
+Changelog = "https://github.com/krrishcoder/pipecat-sarvam/blob/main/CHANGELOG.md"
 Issues = "https://github.com/krrishcoder/pipecat-sarvam/issues"
 Repository = "https://github.com/krrishcoder/pipecat-sarvam"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pipecat_sarvam"]
+
+# The browser harness under ui/ and the local audio fixtures are development
+# tools, so they stay out of the distribution. Everything a user needs to read
+# the code, run the tests, or run the example is included.
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/pipecat_sarvam",
+  "tests",
+  "examples",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

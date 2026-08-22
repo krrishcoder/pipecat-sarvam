@@ -25,6 +25,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   browser harness validates against it instead of mirroring the list.
 - README section comparing this package with Pipecat's built-in
   `SarvamSTTService`, which targets a different Sarvam endpoint.
+- `examples/realtime_stt_bot.py`, a runnable single-file Pipecat bot: browser
+  microphone in, Sarvam transcription out, printing each partial and then the
+  final with the elapsed time since Sarvam detected speech.
+- Packaging metadata for a PyPI release: keywords, fuller classifiers,
+  Documentation and Changelog URLs, and an explicit source-distribution file
+  list that excludes the browser harness and local audio fixtures.
+- A test asserting that `pipecat_sarvam.__version__` and the version in
+  `pyproject.toml` agree, so a release cannot ship a mismatched version.
+
+### Removed
+
+- `examples/realtime_stt.py`, which only constructed the service. Superseded by
+  `examples/realtime_stt_bot.py`.
 
 ### Fixed
 
